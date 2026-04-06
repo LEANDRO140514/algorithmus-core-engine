@@ -1,4 +1,6 @@
 import pino, { type Logger } from "pino";
+import type { EmbeddingService } from "../embedding/EmbeddingService";
+import { getExpectedPineconeDimension } from "../embedding/pineconeDimension";
 import { getPineconeIndex } from "../../infra/pinecone/client";
 import type { RAGDocument, RAGQueryInput } from "./RAGService";
 
@@ -7,18 +9,6 @@ const MIN_TOP_K = 1;
 const MAX_TOP_K = 10;
 const QUERY_PREVIEW_MAX = 100;
 const DEFAULT_PINECONE_QUERY_TIMEOUT_MS = 15_000;
-
-function readEmbeddingDimensionFromEnv(): number | undefined {
-  const raw = process.env.PINECONE_EMBEDDING_DIMENSION;
-  if (typeof raw !== "string" || !raw.trim()) {
-    return undefined;
-  }
-  const n = Number.parseInt(raw.trim(), 10);
-  if (!Number.isFinite(n) || n <= 0) {
-    return undefined;
-  }
-  return n;
-}
 
 function readPineconeQueryTimeoutMs(): number {
   const raw = process.env.PINECONE_QUERY_TIMEOUT_MS;
@@ -73,7 +63,10 @@ function isNonEmptyString(v: unknown): v is string {
 export class PineconeRAGAdapter {
   private readonly rootLog: Logger;
 
-  constructor(logger?: Logger) {
+  constructor(
+    private readonly embeddingService: EmbeddingService,
+    logger?: Logger,
+  ) {
     this.rootLog = logger ?? defaultLog;
   }
 
@@ -99,8 +92,7 @@ export class PineconeRAGAdapter {
         "pinecone query start",
       );
 
-      const vector = await this.embedQuery(queryText);
-      this.assertValidQueryVector(vector);
+      const vector = await this.embedQuery(queryText, log);
 
       const index = getPineconeIndex();
       const timeoutMs = readPineconeQueryTimeoutMs();
@@ -145,31 +137,26 @@ export class PineconeRAGAdapter {
     }
   }
 
-  /**
-   * Punto de extensión: sustituir por cliente de embeddings (OpenAI, local, etc.).
-   * Hoy no implementado a propósito.
-   */
-  private async embedQuery(_query: string): Promise<number[]> {
-    throw new Error("embedQuery not implemented");
-  }
+  private async embedQuery(query: string, log: Logger): Promise<number[]> {
+    const result = await this.embeddingService.embed({
+      text: query,
+    });
+    const vector = result.vector;
 
-  /**
-   * Tras embeddings reales: dimensión debe coincidir con el índice Pinecone.
-   * Configurar `PINECONE_EMBEDDING_DIMENSION` (entero > 0).
-   */
-  private assertValidQueryVector(vector: number[]): void {
-    if (!Array.isArray(vector) || vector.length === 0) {
-      throw new Error("invalid embedding vector");
+    const expectedDim = getExpectedPineconeDimension();
+    if (vector.length !== expectedDim) {
+      throw new Error("invalid query embedding dimension");
     }
-    const expected = readEmbeddingDimensionFromEnv();
-    if (expected === undefined) {
-      throw new Error(
-        "PineconeRAGAdapter: set PINECONE_EMBEDDING_DIMENSION to match the Pinecone index",
-      );
-    }
-    if (vector.length !== expected) {
-      throw new Error("invalid embedding dimension");
-    }
+
+    log.info(
+      {
+        step: "embedding_used",
+        dimensions: vector.length,
+      },
+      "embedding used",
+    );
+
+    return vector;
   }
 
   private validate(input: RAGQueryInput): void {
