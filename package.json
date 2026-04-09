@@ -5,6 +5,7 @@
   },
   "dependencies": {
     "@pinecone-database/pinecone": "^7.1.0",
+    "@sentry/node": "^8.55.1",
     "@supabase/supabase-js": "^2.101.1",
     "express": "^4.22.1",
     "pino": "^10.3.1",
