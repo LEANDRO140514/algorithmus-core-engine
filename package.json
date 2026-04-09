@@ -1,11 +1,17 @@
 {
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/app/server.js"
+  },
   "dependencies": {
     "@pinecone-database/pinecone": "^7.1.0",
     "@supabase/supabase-js": "^2.101.1",
+    "express": "^4.22.1",
     "pino": "^10.3.1",
     "redis": "^5.11.0"
   },
   "devDependencies": {
+    "@types/express": "^4.17.25",
     "@types/node": "^25.5.2",
     "typescript": "^6.0.2"
   }

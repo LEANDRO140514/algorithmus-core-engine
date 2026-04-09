@@ -28,11 +28,20 @@ const defaultLog = pino({
   name: "algorithmus-rag",
 });
 
+export type RAGServiceDeps = {
+  /** Si no se define, `query` no hace retrieval (stub). */
+  vectorSearch?: (input: RAGQueryInput) => Promise<RAGDocument[]>;
+};
+
 export class RAGService {
   private readonly rootLog: Logger;
+  private readonly vectorSearch?: (
+    input: RAGQueryInput,
+  ) => Promise<RAGDocument[]>;
 
-  constructor(logger?: Logger) {
+  constructor(logger?: Logger, deps?: RAGServiceDeps) {
     this.rootLog = logger ?? defaultLog;
+    this.vectorSearch = deps?.vectorSearch;
   }
 
   async query(input: RAGQueryInput): Promise<RAGQueryResult> {
@@ -59,8 +68,6 @@ export class RAGService {
         },
         "rag query start",
       );
-
-      // TODO: embed query before search (vector del texto normalizado para el proveedor).
 
       const documents = await this.searchVectorStore(
         input.tenantId.trim(),
@@ -122,15 +129,14 @@ export class RAGService {
     }
   }
 
-  /**
-   * Retrieval desacoplado del proveedor vectorial (Pinecone, pgvector, etc.).
-   * Stub: devuelve lista vacía hasta integrar el backend real.
-   */
   private async searchVectorStore(
-    _tenantId: string,
-    _query: string,
-    _topK: number,
+    tenantId: string,
+    query: string,
+    topK: number,
   ): Promise<RAGDocument[]> {
-    return [];
+    if (!this.vectorSearch) {
+      return [];
+    }
+    return this.vectorSearch({ tenantId, query, topK });
   }
 }
