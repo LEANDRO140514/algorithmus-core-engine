@@ -77,8 +77,18 @@ export class LLMGateway {
   constructor(deps: LLMGatewayDeps);
   constructor(logger?: Logger);
   constructor(arg?: Logger | LLMGatewayDeps) {
-    const deps: LLMGatewayDeps = isLoggerLike(arg) ? { logger: arg } : (arg ?? {});
+    const legacyPositional = isLoggerLike(arg);
+    const deps: LLMGatewayDeps = legacyPositional ? { logger: arg } : (arg ?? {});
     this.rootLog = deps.logger ?? defaultLog;
+    if (legacyPositional) {
+      this.rootLog.warn(
+        {
+          event: "deprecated_constructor_usage",
+          service: "LLMGateway",
+        },
+        "usar new LLMGateway({ logger })",
+      );
+    }
   }
 
   async generate(input: LLMInput): Promise<LLMResponse> {

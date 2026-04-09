@@ -1,11 +1,12 @@
 import pino, { type Logger } from "pino";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import type { ExtractedData, FSMContext, FSMResult } from "../fsm/FSMEngine";
 import { FSMEngine } from "../fsm/FSMEngine";
 import type { LLMInput, LLMResponse } from "../llm/LLMGateway";
 import { LLMGateway } from "../llm/LLMGateway";
 import type { RAGQueryResult } from "../rag/RAGService";
 import { RAGService } from "../rag/RAGService";
-import { createSupabaseServerClient as getSupabase } from "../supabase_client";
+import { createSupabaseServerClient } from "../supabase_client";
 
 const RAG_CONTEXT_MAX_CHARS = 2000;
 const RAG_DOCUMENT_MAX_CHARS = 500;
@@ -26,13 +27,40 @@ export type OrchestratorProcessResult = {
 };
 
 export type OrchestratorDeps = {
+  logger?: Logger;
+  supabase: () => SupabaseClient;
+  fsmEngine: FSMEngine;
+  llmGateway: LLMGateway;
+  ragService: RAGService;
+};
+
+type LegacyOrchestratorObjectDeps = {
   fsm: FSMEngine;
   llm: LLMGateway;
   rag: RAGService;
   logger?: Logger;
 };
 
-function isOrchestratorDeps(x: unknown): x is OrchestratorDeps {
+function isCanonicalOrchestratorDeps(x: unknown): x is OrchestratorDeps {
+  if (x === null || typeof x !== "object") {
+    return false;
+  }
+  const o = x as Record<string, unknown>;
+  return (
+    "fsmEngine" in o &&
+    "llmGateway" in o &&
+    "ragService" in o &&
+    "supabase" in o &&
+    typeof o.supabase === "function" &&
+    o.fsmEngine != null &&
+    o.llmGateway != null &&
+    o.ragService != null
+  );
+}
+
+function isLegacyOrchestratorObjectDeps(
+  x: unknown,
+): x is LegacyOrchestratorObjectDeps {
   if (x === null || typeof x !== "object") {
     return false;
   }
@@ -41,6 +69,7 @@ function isOrchestratorDeps(x: unknown): x is OrchestratorDeps {
     "fsm" in o &&
     "llm" in o &&
     "rag" in o &&
+    !("fsmEngine" in o) &&
     o.fsm != null &&
     o.llm != null &&
     o.rag != null
@@ -55,6 +84,7 @@ export class Orchestrator {
   private readonly llm: LLMGateway;
   private readonly rag: RAGService;
   private readonly log: Logger;
+  private readonly supabase: () => SupabaseClient;
 
   constructor(deps: OrchestratorDeps);
   constructor(
@@ -64,21 +94,45 @@ export class Orchestrator {
     logger?: Logger,
   );
   constructor(
-    arg1: FSMEngine | OrchestratorDeps,
+    arg1: FSMEngine | OrchestratorDeps | LegacyOrchestratorObjectDeps,
     arg2?: LLMGateway,
     arg3?: RAGService,
     arg4?: Logger,
   ) {
-    if (isOrchestratorDeps(arg1)) {
+    if (isCanonicalOrchestratorDeps(arg1)) {
+      this.fsm = arg1.fsmEngine;
+      this.llm = arg1.llmGateway;
+      this.rag = arg1.ragService;
+      this.log = arg1.logger ?? defaultLog;
+      this.supabase = arg1.supabase;
+    } else if (isLegacyOrchestratorObjectDeps(arg1)) {
       this.fsm = arg1.fsm;
       this.llm = arg1.llm;
       this.rag = arg1.rag;
       this.log = arg1.logger ?? defaultLog;
+      this.supabase = createSupabaseServerClient;
+      this.log.warn(
+        {
+          event: "deprecated_constructor_usage",
+          service: "Orchestrator",
+          variant: "object_fsm_llm_rag",
+        },
+        "usar OrchestratorDeps con supabase, fsmEngine, llmGateway, ragService",
+      );
     } else {
-      this.fsm = arg1;
+      this.fsm = arg1 as FSMEngine;
       this.llm = arg2 as LLMGateway;
       this.rag = arg3 as RAGService;
       this.log = arg4 ?? defaultLog;
+      this.supabase = createSupabaseServerClient;
+      this.log.warn(
+        {
+          event: "deprecated_constructor_usage",
+          service: "Orchestrator",
+          variant: "positional",
+        },
+        "usar OrchestratorDeps con supabase, fsmEngine, llmGateway, ragService",
+      );
     }
   }
 
@@ -347,7 +401,7 @@ ${context.message}
         "fsm persist attempt",
       );
 
-      const supabase = getSupabase();
+      const supabase = this.supabase();
       const { error } = await supabase
         .from("leads")
         .update({

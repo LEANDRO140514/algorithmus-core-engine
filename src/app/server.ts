@@ -1,3 +1,10 @@
+/**
+ * Composition root: wiring, Express, listen. Sin lógica de negocio.
+ *
+ * Env críticas: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, REDIS_URL,
+ * OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_HOST.
+ * PORT opcional (default 3000).
+ */
 import express, {
   type Request,
   type RequestHandler,
@@ -38,19 +45,12 @@ function asyncHandler(
 }
 
 async function main(): Promise<void> {
-  requireEnv("SUPABASE_URL");
-  requireEnv("SUPABASE_SERVICE_ROLE_KEY");
+  const supabaseUrl = requireEnv("SUPABASE_URL");
+  const supabaseServiceRoleKey = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
   requireEnv("REDIS_URL");
   requireEnv("OPENAI_API_KEY");
   requireEnv("PINECONE_API_KEY");
   requireEnv("PINECONE_INDEX_HOST");
-
-  if (!process.env.PINECONE_DIMENSION?.trim()) {
-    process.env.PINECONE_DIMENSION = "1536";
-  }
-  if (!process.env.PINECONE_QUERY_TIMEOUT_MS?.trim()) {
-    process.env.PINECONE_QUERY_TIMEOUT_MS = "5000";
-  }
 
   const portRaw = process.env.PORT?.trim() || "3000";
   const PORT = Number.parseInt(portRaw, 10);
@@ -59,46 +59,53 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  process.env.PRIMA_DONNA_SUPABASE_URL = process.env.SUPABASE_URL!.trim();
-  process.env.PRIMA_DONNA_SUPABASE_SERVICE_ROLE_KEY =
-    process.env.SUPABASE_SERVICE_ROLE_KEY!.trim();
-
+  // --- Infra ---
   await getRedis();
 
-  const supabase = createClient(
-    process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
+  const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
     },
-  );
+  });
 
+  // --- AI ---
   const embeddingService = new EmbeddingService(log);
   const pineconeRag = new PineconeRAGAdapter(embeddingService, log);
-  const rag = new RAGService(log, {
-    vectorSearch: (input) => pineconeRag.query(input),
+  const rag = new RAGService({
+    logger: log,
+    adapter: pineconeRag,
   });
 
-  const fsm = new FSMEngine();
-  const llm = new LLMGateway(log);
+  // --- Core ---
+  const fsmEngine = new FSMEngine();
+  const llmGateway = new LLMGateway({ logger: log });
   const identityManager = new IdentityManager({
     supabase: () => supabase,
-    baseLogger: log,
+    getRedis,
+    logger: log,
   });
-  const orchestrator = new Orchestrator(fsm, llm, rag, log);
+  const orchestrator = new Orchestrator({
+    logger: log,
+    supabase: () => supabase,
+    fsmEngine,
+    llmGateway,
+    ragService: rag,
+  });
 
-  configureWhatsAppHandler({ identityManager, orchestrator });
-
+  // --- Express ---
   const app = express();
   app.use(express.json());
+
+  // --- Handlers (antes de rutas que usan el closure) ---
+  configureWhatsAppHandler({ identityManager, orchestrator });
+
   app.get("/health", (_req, res) => {
     res.json({ ok: true });
   });
   app.post("/webhooks/whatsapp", asyncHandler(handleWhatsAppWebhook));
 
+  // --- Listen ---
   app.listen(PORT, () => {
     log.info({ event: "server_start", port: PORT }, "server start");
   });

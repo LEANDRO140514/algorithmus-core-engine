@@ -79,8 +79,20 @@ export class RAGService {
   constructor(deps: RAGServiceDeps);
   constructor(logger: Logger, deps: Pick<RAGServiceDeps, "adapter" | "vectorSearch">);
   constructor(arg1?: Logger | RAGServiceDeps, arg2?: Pick<RAGServiceDeps, "adapter" | "vectorSearch">) {
+    const legacy =
+      arg2 !== undefined ||
+      (arg1 !== undefined && isLoggerLike(arg1));
     const deps = resolveRagDeps(arg1, arg2);
     this.rootLog = deps.logger ?? defaultLog;
+    if (legacy) {
+      this.rootLog.warn(
+        {
+          event: "deprecated_constructor_usage",
+          service: "RAGService",
+        },
+        "usar new RAGService({ logger, adapter })",
+      );
+    }
     this.vectorSearch =
       deps.adapter != null
         ? (input) => deps.adapter!.query(input)
