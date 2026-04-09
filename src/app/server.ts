@@ -2,7 +2,12 @@
  * Composition root: wiring, Express, listen. Sin lógica de negocio.
  *
  * Env críticas: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, REDIS_URL,
- * OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_HOST.
+ * OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_HOST,
+ * YCLOUD_API_KEY, YCLOUD_WHATSAPP_FROM.
+ * Opcionales: YCLOUD_BASE_URL (default https://api.ycloud.com/v2), YCLOUD_REQUEST_TIMEOUT_MS,
+ * YCLOUD_WEBHOOK_SECRET, YCLOUD_WEBHOOK_REJECT_UNVERIFIED_IN_PRODUCTION,
+ * YCLOUD_INBOUND_IDEMPOTENCY_TTL_SEC.
+ * Opcional: SENTRY_DSN, SENTRY_ENV, SENTRY_BASE_RATE, SENTRY_WEBHOOK_RATE.
  * PORT opcional (default 3000).
  */
 import express, {
@@ -11,6 +16,10 @@ import express, {
   type Response,
 } from "express";
 import { createClient } from "@supabase/supabase-js";
+import {
+  initSentry,
+  setupExpressErrorHandler,
+} from "../infra/observability/sentry";
 import { EmbeddingService } from "../core/embedding/EmbeddingService";
 import { FSMEngine } from "../core/fsm/FSMEngine";
 import { IdentityManager } from "../core/identity/IdentityManager";
@@ -23,7 +32,12 @@ import {
   configureWhatsAppHandler,
   handleWhatsAppWebhook,
 } from "../infra/handlers/whatsappHandler";
+import { YCloudClient } from "../infra/providers/ycloud/ycloudClient";
+import { YCloudInboundIdempotency } from "../infra/providers/ycloud/ycloudIdempotency";
+import { YCloudSender } from "../infra/providers/ycloud/ycloudSender";
+import { YCloudWebhookVerifier } from "../infra/providers/ycloud/ycloudWebhookVerifier";
 import { getRedis } from "../infra/redis/client";
+import { registerHttpRoutes } from "./routes";
 
 const log = baseLogger.child({ module: "server" });
 
@@ -36,6 +50,20 @@ function requireEnv(name: string): string {
   return value;
 }
 
+function readEnvOptional(name: string, fallback: string): string {
+  const raw = process.env[name]?.trim();
+  return raw && raw.length > 0 ? raw : fallback;
+}
+
+function readPositiveInt(name: string, defaultValue: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return defaultValue;
+  }
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : defaultValue;
+}
+
 function asyncHandler(
   fn: (req: Request, res: Response) => Promise<void>,
 ): RequestHandler {
@@ -45,12 +73,32 @@ function asyncHandler(
 }
 
 async function main(): Promise<void> {
+  initSentry();
+
   const supabaseUrl = requireEnv("SUPABASE_URL");
   const supabaseServiceRoleKey = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
   requireEnv("REDIS_URL");
   requireEnv("OPENAI_API_KEY");
   requireEnv("PINECONE_API_KEY");
   requireEnv("PINECONE_INDEX_HOST");
+
+  const ycloudApiKey = requireEnv("YCLOUD_API_KEY");
+  const ycloudFrom = requireEnv("YCLOUD_WHATSAPP_FROM");
+
+  const ycloudBaseUrl = readEnvOptional(
+    "YCLOUD_BASE_URL",
+    "https://api.ycloud.com/v2",
+  );
+  const ycloudTimeoutMs = readPositiveInt("YCLOUD_REQUEST_TIMEOUT_MS", 5000);
+  const idempotencyTtlSec = readPositiveInt(
+    "YCLOUD_INBOUND_IDEMPOTENCY_TTL_SEC",
+    300,
+  );
+
+  const ycloudWebhookSecret = process.env.YCLOUD_WEBHOOK_SECRET?.trim() || "";
+  const rejectUnverified =
+    process.env.YCLOUD_WEBHOOK_REJECT_UNVERIFIED_IN_PRODUCTION?.trim() ===
+    "true";
 
   const portRaw = process.env.PORT?.trim() || "3000";
   const PORT = Number.parseInt(portRaw, 10);
@@ -67,6 +115,31 @@ async function main(): Promise<void> {
       autoRefreshToken: false,
       persistSession: false,
     },
+  });
+
+  const ycloudClient = new YCloudClient({
+    logger: log,
+    apiKey: ycloudApiKey,
+    baseUrl: ycloudBaseUrl,
+    timeoutMs: ycloudTimeoutMs,
+  });
+
+  const ycloudSender = new YCloudSender({
+    client: ycloudClient,
+    logger: log,
+    defaultFrom: ycloudFrom,
+  });
+
+  const ycloudVerifier = new YCloudWebhookVerifier({
+    logger: log,
+    webhookSecret: ycloudWebhookSecret || undefined,
+    rejectUnverifiedInProduction: rejectUnverified,
+  });
+
+  const ycloudIdempotency = new YCloudInboundIdempotency({
+    getRedis,
+    logger: log,
+    ttlSec: idempotencyTtlSec,
   });
 
   // --- AI ---
@@ -93,17 +166,27 @@ async function main(): Promise<void> {
     ragService: rag,
   });
 
+  // --- Handlers ---
+  configureWhatsAppHandler({
+    identityManager,
+    orchestrator,
+    webhookVerifier: ycloudVerifier,
+    idempotency: ycloudIdempotency,
+    sender: ycloudSender,
+  });
+
   // --- Express ---
   const app = express();
   app.use(express.json());
 
-  // --- Handlers (antes de rutas que usan el closure) ---
-  configureWhatsAppHandler({ identityManager, orchestrator });
-
-  app.get("/health", (_req, res) => {
-    res.json({ ok: true });
+  registerHttpRoutes(app, {
+    health: (_req, res) => {
+      res.json({ ok: true });
+    },
+    whatsappWebhook: asyncHandler(handleWhatsAppWebhook),
   });
-  app.post("/webhooks/whatsapp", asyncHandler(handleWhatsAppWebhook));
+
+  setupExpressErrorHandler(app);
 
   // --- Listen ---
   app.listen(PORT, () => {

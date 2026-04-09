@@ -1,18 +1,17 @@
-import express, { type Request, type RequestHandler, type Response } from "express";
-import { handleWhatsAppWebhook } from "../infra/handlers/whatsappHandler";
+import type { Express, RequestHandler } from "express";
 
-const app = express();
+export type HttpRouteHandlers = {
+  health: RequestHandler;
+  whatsappWebhook: RequestHandler;
+};
 
-app.use(express.json());
-
-function asyncHandler(
-  fn: (req: Request, res: Response) => Promise<void>,
-): RequestHandler {
-  return (req, res, next) => {
-    void fn(req, res).catch(next);
-  };
+/**
+ * Registro único de rutas HTTP (composition root monta el `app` y llama esto).
+ */
+export function registerHttpRoutes(
+  app: Express,
+  handlers: HttpRouteHandlers,
+): void {
+  app.get("/health", handlers.health);
+  app.post("/webhooks/whatsapp", handlers.whatsappWebhook);
 }
-
-app.post("/webhooks/whatsapp", asyncHandler(handleWhatsAppWebhook));
-
-export default app;

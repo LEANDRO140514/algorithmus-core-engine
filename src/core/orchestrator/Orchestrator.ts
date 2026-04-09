@@ -11,10 +11,48 @@ import { createSupabaseServerClient } from "../supabase_client";
 const RAG_CONTEXT_MAX_CHARS = 2000;
 const RAG_DOCUMENT_MAX_CHARS = 500;
 
+/** Default topK RAG; override opcional `ORCHESTRATOR_RAG_TOP_K` (1–50). */
+const DEFAULT_RAG_TOP_K = 5;
+const envRagTopK = process.env.ORCHESTRATOR_RAG_TOP_K?.trim();
+const parsedTopK = envRagTopK
+  ? Number.parseInt(envRagTopK, 10)
+  : Number.NaN;
+const RAG_TOP_K =
+  Number.isFinite(parsedTopK) &&
+  parsedTopK > 0 &&
+  parsedTopK <= 50
+    ? parsedTopK
+    : DEFAULT_RAG_TOP_K;
+
 const defaultLog = pino({
   level: process.env.LOG_LEVEL ?? "info",
   name: "algorithmus-orchestrator",
 });
+
+/**
+ * Resultado de persistencia FSM en DB.
+ * - `outcome: "skipped_unchanged"`: no hubo `UPDATE` (estado siguiente igual al actual).
+ * - `outcome: "written"`: fila `leads` actualizada.
+ */
+export type FsmPersistResult =
+  | { ok: true; outcome: "skipped_unchanged" | "written" }
+  | { ok: false; error: string };
+
+/**
+ * Diagnóstico RAG acotado (sin strings libres salvo `detail` en error de retrieval).
+ */
+export type OrchestratorRagDiagnostic =
+  | { readonly type: "no_documents" }
+  | { readonly type: "retrieval_failed"; readonly detail: string };
+
+/**
+ * Shape cerrado de observabilidad interna (no exponer al usuario).
+ */
+export type OrchestratorInternalDiagnostics = Readonly<{
+  persistError?: string;
+  llmFailureReason?: string;
+  ragFailure?: OrchestratorRagDiagnostic;
+}>;
 
 export type OrchestratorProcessResult = {
   /** Primera evaluación FSM (acción a ejecutar). */
@@ -24,6 +62,18 @@ export type OrchestratorProcessResult = {
   llmResponse?: LLMResponse;
   /** Texto listo para enviar al usuario (siempre definido). */
   messageToSend: string;
+  /**
+   * `true`: persistencia OK **o** no fue necesaria escribir (estado sin cambio).
+   * `false`: falló el `UPDATE` en DB.
+   */
+  fsmPersisted?: boolean;
+  /**
+   * Presente cuando `fsmPersisted === true`: `unchanged` = sin `UPDATE` (mismo estado);
+   * `written` = fila actualizada. Ausente si falló la persistencia (`fsmPersisted === false`).
+   */
+  fsmPersistenceOutcome?: "unchanged" | "written";
+  /** Observabilidad; no exponer al usuario final. */
+  internalDiagnostics?: OrchestratorInternalDiagnostics;
 };
 
 export type OrchestratorDeps = {
@@ -56,6 +106,21 @@ function isCanonicalOrchestratorDeps(x: unknown): x is OrchestratorDeps {
     o.llmGateway != null &&
     o.ragService != null
   );
+}
+
+function internalDiagnosticsNonEmpty(
+  d: OrchestratorInternalDiagnostics,
+): boolean {
+  if (d.persistError !== undefined && d.persistError !== "") {
+    return true;
+  }
+  if (d.llmFailureReason !== undefined && d.llmFailureReason !== "") {
+    return true;
+  }
+  if (d.ragFailure !== undefined) {
+    return true;
+  }
+  return false;
 }
 
 function isLegacyOrchestratorObjectDeps(
@@ -115,6 +180,7 @@ export class Orchestrator {
         {
           event: "deprecated_constructor_usage",
           service: "Orchestrator",
+          mode: "legacy",
           variant: "object_fsm_llm_rag",
         },
         "usar OrchestratorDeps con supabase, fsmEngine, llmGateway, ragService",
@@ -129,6 +195,7 @@ export class Orchestrator {
         {
           event: "deprecated_constructor_usage",
           service: "Orchestrator",
+          mode: "legacy",
           variant: "positional",
         },
         "usar OrchestratorDeps con supabase, fsmEngine, llmGateway, ragService",
@@ -140,7 +207,10 @@ export class Orchestrator {
     const log = this.log.child({
       module: "Orchestrator",
       trace_id: context.traceId,
+      tenant_id: context.tenantId,
+      lead_id: context.leadId,
     });
+
     const initial = this.fsm.evaluate(context);
 
     log.info(
@@ -154,19 +224,17 @@ export class Orchestrator {
 
     switch (initial.action) {
       case "classify_intent": {
-        const gen = await this.invokeLlm(
-          "classify_intent",
-          context,
-          log,
-        );
+        const gen = await this.invokeLlm("classify_intent", context, log);
         if (!gen.ok) {
           const final = initial;
-          await this.persistFsmState(context, final, log);
-          return {
+          return this.finalizeWithPersist(context, final, log, {
             initial,
             final,
             messageToSend: "Hubo un problema, intenta nuevamente.",
-          };
+            internalDiagnostics: {
+              llmFailureReason: gen.errorDetail,
+            },
+          });
         }
         const { llmResponse } = gen;
         const extractedData = this.mergeClassify(context, llmResponse);
@@ -179,22 +247,28 @@ export class Orchestrator {
           { step: "fsm_final", nextState: final.nextState },
           "fsm final",
         );
-        await this.persistFsmState(context, final, log);
         const messageToSend =
           llmResponse.text ?? "Procesando tu solicitud...";
-        return { initial, final, llmResponse, messageToSend };
+        return this.finalizeWithPersist(context, final, log, {
+          initial,
+          final,
+          llmResponse,
+          messageToSend,
+        });
       }
 
       case "extract_slots": {
         const gen = await this.invokeLlm("extract_slots", context, log);
         if (!gen.ok) {
           const final = initial;
-          await this.persistFsmState(context, final, log);
-          return {
+          return this.finalizeWithPersist(context, final, log, {
             initial,
             final,
             messageToSend: "Hubo un problema, intenta nuevamente.",
-          };
+            internalDiagnostics: {
+              llmFailureReason: gen.errorDetail,
+            },
+          });
         }
         const { llmResponse } = gen;
         const extractedData = this.mergeExtractSlots(context, llmResponse);
@@ -207,30 +281,38 @@ export class Orchestrator {
           { step: "fsm_final", nextState: final.nextState },
           "fsm final",
         );
-        await this.persistFsmState(context, final, log);
         const messageToSend =
           llmResponse.text ?? "Procesando tu solicitud...";
-        return { initial, final, llmResponse, messageToSend };
+        return this.finalizeWithPersist(context, final, log, {
+          initial,
+          final,
+          llmResponse,
+          messageToSend,
+        });
       }
 
       case "query_rag": {
         let ragResult: RAGQueryResult;
+        let ragQueryErrorDetail: string | undefined;
         try {
           ragResult = await this.rag.query({
             tenantId: context.tenantId,
             query: context.message,
-            topK: 5,
+            topK: RAG_TOP_K,
           });
         } catch (ragErr) {
+          const detail =
+            ragErr instanceof Error ? ragErr.message : String(ragErr);
+          ragQueryErrorDetail = detail;
           log.error(
             {
               step: "rag_error",
-              error:
-                ragErr instanceof Error ? ragErr.message : String(ragErr),
+              error: detail,
+              rag_top_k: RAG_TOP_K,
             },
             "rag retrieval error",
           );
-          ragResult = { documents: [], usedTopK: 5 };
+          ragResult = { documents: [], usedTopK: RAG_TOP_K };
         }
 
         if (ragResult.documents.length === 0) {
@@ -244,16 +326,19 @@ export class Orchestrator {
             "rag context built",
           );
           const final = initial;
-          await this.persistFsmState(context, final, log);
-          return {
+          return this.finalizeWithPersist(context, final, log, {
             initial,
             final,
             messageToSend:
               "No encontré información relevante, ¿puedes dar más detalles?",
-          };
+            internalDiagnostics: {
+              ragFailure: ragQueryErrorDetail
+                ? { type: "retrieval_failed", detail: ragQueryErrorDetail }
+                : { type: "no_documents" },
+            },
+          });
         }
 
-        // Mayor score primero (relevante cuando el vector store devuelve ranking real).
         const docsOrdered = [...ragResult.documents].sort(
           (a, b) => b.score - a.score,
         );
@@ -279,8 +364,11 @@ export class Orchestrator {
         );
 
         const ragPrompt = `
-Usa el siguiente contexto para responder:
+Responde únicamente usando el contexto proporcionado debajo.
+Si la información no es suficiente para responder con certeza, responde exactamente: "No tengo suficiente información para responder con certeza."
+No inventes información ni uses conocimiento que no aparezca en el contexto.
 
+Contexto:
 ${safeContextText}
 
 Pregunta del usuario:
@@ -292,12 +380,14 @@ ${context.message}
         });
         if (!gen.ok) {
           const final = initial;
-          await this.persistFsmState(context, final, log);
-          return {
+          return this.finalizeWithPersist(context, final, log, {
             initial,
             final,
             messageToSend: "Hubo un problema, intenta nuevamente.",
-          };
+            internalDiagnostics: {
+              llmFailureReason: gen.errorDetail,
+            },
+          });
         }
         const { llmResponse } = gen;
         const newData: ExtractedData = {
@@ -317,27 +407,28 @@ ${context.message}
           { step: "fsm_final", nextState: final.nextState },
           "fsm final",
         );
-        await this.persistFsmState(context, final, log);
         const messageToSend =
           llmResponse.text ?? "Procesando tu solicitud...";
-        return {
+        return this.finalizeWithPersist(context, final, log, {
           initial,
           final,
           llmResponse,
           messageToSend,
-        };
+        });
       }
 
       case "reply": {
         const gen = await this.invokeLlm("generate_reply", context, log);
         if (!gen.ok) {
           const final = initial;
-          await this.persistFsmState(context, final, log);
-          return {
+          return this.finalizeWithPersist(context, final, log, {
             initial,
             final,
             messageToSend: "Hubo un problema, intenta nuevamente.",
-          };
+            internalDiagnostics: {
+              llmFailureReason: gen.errorDetail,
+            },
+          });
         }
         const { llmResponse } = gen;
         const extractedData = {
@@ -352,15 +443,14 @@ ${context.message}
           { step: "fsm_final", nextState: final.nextState },
           "fsm final",
         );
-        await this.persistFsmState(context, final, log);
         const messageToSend =
           llmResponse.text ?? "Procesando tu solicitud...";
-        return {
+        return this.finalizeWithPersist(context, final, log, {
           initial,
           final,
           llmResponse,
           messageToSend,
-        };
+        });
       }
 
       case "book_appointment":
@@ -371,23 +461,65 @@ ${context.message}
           { step: "fsm_final", nextState: final.nextState },
           "fsm final",
         );
-        await this.persistFsmState(context, final, log);
-        return {
+        return this.finalizeWithPersist(context, final, log, {
           initial,
           final,
           messageToSend: "Procesando tu solicitud...",
-        };
+        });
       }
     }
+  }
+
+  private async finalizeWithPersist(
+    context: FSMContext,
+    final: FSMResult,
+    log: Logger,
+    partial: {
+      initial: FSMResult;
+      final: FSMResult;
+      messageToSend: string;
+      llmResponse?: LLMResponse;
+      internalDiagnostics?: OrchestratorInternalDiagnostics;
+    },
+  ): Promise<OrchestratorProcessResult> {
+    const persist = await this.persistFsmState(context, final, log);
+
+    const merged: OrchestratorInternalDiagnostics = {
+      ...partial.internalDiagnostics,
+      ...(persist.ok ? {} : { persistError: persist.error }),
+    };
+
+    const hasDiag = internalDiagnosticsNonEmpty(merged);
+
+    const fsmPersistenceOutcome: OrchestratorProcessResult["fsmPersistenceOutcome"] =
+      persist.ok
+        ? persist.outcome === "skipped_unchanged"
+          ? "unchanged"
+          : "written"
+        : undefined;
+
+    return {
+      initial: partial.initial,
+      final: partial.final,
+      messageToSend: partial.messageToSend,
+      ...(partial.llmResponse !== undefined
+        ? { llmResponse: partial.llmResponse }
+        : {}),
+      fsmPersisted: persist.ok,
+      ...(fsmPersistenceOutcome !== undefined
+        ? { fsmPersistenceOutcome }
+        : {}),
+      ...(hasDiag ? { internalDiagnostics: merged } : {}),
+    };
   }
 
   private async persistFsmState(
     context: FSMContext,
     final: FSMResult,
     log: Logger,
-  ): Promise<void> {
+  ): Promise<FsmPersistResult> {
     if (context.currentState === final.nextState) {
-      return;
+      return { ok: true, outcome: "skipped_unchanged" };
     }
 
     try {
@@ -423,14 +555,19 @@ ${context.message}
         },
         "fsm persist",
       );
+      return { ok: true, outcome: "written" };
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       log.error(
         {
           step: "fsm_persist_error",
-          error: err instanceof Error ? err.message : err,
+          error: msg,
+          leadId: context.leadId,
+          tenant_id: context.tenantId,
         },
         "fsm persist error",
       );
+      return { ok: false, error: msg };
     }
   }
 
@@ -441,7 +578,7 @@ ${context.message}
     options?: { input?: string },
   ): Promise<
     | { ok: true; llmResponse: LLMResponse }
-    | { ok: false }
+    | { ok: false; errorDetail: string }
   > {
     const input = options?.input ?? context.message;
     log.info(
@@ -468,14 +605,19 @@ ${context.message}
       );
       return { ok: true, llmResponse };
     } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
       log.error(
         {
           step: "llm_error",
-          error: err instanceof Error ? err.message : err,
+          task,
+          error: detail,
+          tenant_id: context.tenantId,
+          lead_id: context.leadId,
+          trace_id: context.traceId,
         },
         "llm error",
       );
-      return { ok: false };
+      return { ok: false, errorDetail: detail };
     }
   }
 
@@ -506,5 +648,4 @@ ${context.message}
       ...newData,
     };
   }
-
 }
