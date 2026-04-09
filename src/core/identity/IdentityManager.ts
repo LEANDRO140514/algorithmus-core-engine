@@ -83,7 +83,10 @@ function lockKeyForResolve(
 
 export type IdentityManagerDeps = {
   supabase?: () => SupabaseClient;
+  /** Por defecto se usa `getRedis` del módulo infra. */
+  getRedis?: typeof getRedis;
   ghl?: GHLIntegration;
+  logger?: Logger;
   baseLogger?: Logger;
 };
 
@@ -93,13 +96,16 @@ export type IdentityManagerDeps = {
  */
 export class IdentityManager {
   private readonly getSupabase: () => SupabaseClient;
+  private readonly connectRedis: typeof getRedis;
   private readonly ghl: GHLIntegration;
   private readonly baseLogger: Logger;
 
   constructor(deps: IdentityManagerDeps = {}) {
     this.getSupabase = deps.supabase ?? createSupabaseServerClient;
+    this.connectRedis = deps.getRedis ?? getRedis;
     this.ghl = deps.ghl ?? new GHLIntegrationStub();
     this.baseLogger =
+      deps.logger ??
       deps.baseLogger ??
       pino({
         level: process.env.LOG_LEVEL ?? "info",
@@ -156,7 +162,7 @@ export class IdentityManager {
     const token = traceId;
 
     log.info({ step: "lock_acquire_start", lockKey }, "adquiriendo lock Redis");
-    const redis = await getRedis();
+    const redis = await this.connectRedis();
     const locked = await this.acquireLockWithRetry(lockKey, token, log, redis);
     if (!locked) {
       log.warn({ step: "lock_failed", lockKey }, "contención de lock");
@@ -252,7 +258,7 @@ export class IdentityManager {
     key: string,
     value: string,
     log: Logger,
-    redis: Awaited<ReturnType<typeof getRedis>>,
+    redis: Awaited<ReturnType<IdentityManager["connectRedis"]>>,
   ): Promise<boolean> {
     for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
       const ok = await redis.set(key, value, {

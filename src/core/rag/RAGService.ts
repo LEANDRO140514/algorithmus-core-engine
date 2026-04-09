@@ -28,10 +28,47 @@ const defaultLog = pino({
   name: "algorithmus-rag",
 });
 
+export type RAGVectorAdapter = {
+  query(input: RAGQueryInput): Promise<RAGDocument[]>;
+};
+
 export type RAGServiceDeps = {
-  /** Si no se define, `query` no hace retrieval (stub). */
+  logger?: Logger;
+  /** Retrieval vía adapter (p. ej. PineconeRAGAdapter). */
+  adapter?: RAGVectorAdapter;
+  /** Alias de función; preferir `adapter` cuando sea instancia con `.query`. */
   vectorSearch?: (input: RAGQueryInput) => Promise<RAGDocument[]>;
 };
+
+function isLoggerLike(x: unknown): x is Logger {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    "info" in x &&
+    typeof (x as { info?: unknown }).info === "function"
+  );
+}
+
+function resolveRagDeps(
+  arg1?: Logger | RAGServiceDeps,
+  arg2?: Pick<RAGServiceDeps, "adapter" | "vectorSearch">,
+): RAGServiceDeps {
+  if (arg2 !== undefined) {
+    if (!isLoggerLike(arg1)) {
+      throw new Error(
+        "RAGService: el segundo argumento solo es válido si el primero es logger",
+      );
+    }
+    return { logger: arg1, ...arg2 };
+  }
+  if (arg1 === undefined) {
+    return {};
+  }
+  if (isLoggerLike(arg1)) {
+    return { logger: arg1 };
+  }
+  return arg1;
+}
 
 export class RAGService {
   private readonly rootLog: Logger;
@@ -39,9 +76,15 @@ export class RAGService {
     input: RAGQueryInput,
   ) => Promise<RAGDocument[]>;
 
-  constructor(logger?: Logger, deps?: RAGServiceDeps) {
-    this.rootLog = logger ?? defaultLog;
-    this.vectorSearch = deps?.vectorSearch;
+  constructor(deps: RAGServiceDeps);
+  constructor(logger: Logger, deps: Pick<RAGServiceDeps, "adapter" | "vectorSearch">);
+  constructor(arg1?: Logger | RAGServiceDeps, arg2?: Pick<RAGServiceDeps, "adapter" | "vectorSearch">) {
+    const deps = resolveRagDeps(arg1, arg2);
+    this.rootLog = deps.logger ?? defaultLog;
+    this.vectorSearch =
+      deps.adapter != null
+        ? (input) => deps.adapter!.query(input)
+        : deps.vectorSearch;
   }
 
   async query(input: RAGQueryInput): Promise<RAGQueryResult> {

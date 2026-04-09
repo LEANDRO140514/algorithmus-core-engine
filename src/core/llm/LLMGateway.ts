@@ -25,6 +25,19 @@ const defaultLog = pino({
   name: "algorithmus-llm",
 });
 
+export type LLMGatewayDeps = {
+  logger?: Logger;
+};
+
+function isLoggerLike(x: unknown): x is Logger {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    "info" in x &&
+    typeof (x as { info?: unknown }).info === "function"
+  );
+}
+
 const TIMEOUT_MS = 5000;
 
 function abortAfter(ms: number): AbortSignal {
@@ -61,8 +74,11 @@ function coerceIntent(
 export class LLMGateway {
   private readonly rootLog: Logger;
 
-  constructor(logger?: Logger) {
-    this.rootLog = logger ?? defaultLog;
+  constructor(deps: LLMGatewayDeps);
+  constructor(logger?: Logger);
+  constructor(arg?: Logger | LLMGatewayDeps) {
+    const deps: LLMGatewayDeps = isLoggerLike(arg) ? { logger: arg } : (arg ?? {});
+    this.rootLog = deps.logger ?? defaultLog;
   }
 
   async generate(input: LLMInput): Promise<LLMResponse> {

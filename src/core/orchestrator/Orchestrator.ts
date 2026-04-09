@@ -25,19 +25,61 @@ export type OrchestratorProcessResult = {
   messageToSend: string;
 };
 
+export type OrchestratorDeps = {
+  fsm: FSMEngine;
+  llm: LLMGateway;
+  rag: RAGService;
+  logger?: Logger;
+};
+
+function isOrchestratorDeps(x: unknown): x is OrchestratorDeps {
+  if (x === null || typeof x !== "object") {
+    return false;
+  }
+  const o = x as Record<string, unknown>;
+  return (
+    "fsm" in o &&
+    "llm" in o &&
+    "rag" in o &&
+    o.fsm != null &&
+    o.llm != null &&
+    o.rag != null
+  );
+}
+
 /**
  * Orquesta FSM + LLM: la FSM define la acción; este módulo solo invoca al gateway y re-evalúa.
  */
 export class Orchestrator {
+  private readonly fsm: FSMEngine;
+  private readonly llm: LLMGateway;
+  private readonly rag: RAGService;
   private readonly log: Logger;
 
+  constructor(deps: OrchestratorDeps);
   constructor(
-    private readonly fsm: FSMEngine,
-    private readonly llm: LLMGateway,
-    private readonly rag: RAGService,
+    fsm: FSMEngine,
+    llm: LLMGateway,
+    rag: RAGService,
     logger?: Logger,
+  );
+  constructor(
+    arg1: FSMEngine | OrchestratorDeps,
+    arg2?: LLMGateway,
+    arg3?: RAGService,
+    arg4?: Logger,
   ) {
-    this.log = logger ?? defaultLog;
+    if (isOrchestratorDeps(arg1)) {
+      this.fsm = arg1.fsm;
+      this.llm = arg1.llm;
+      this.rag = arg1.rag;
+      this.log = arg1.logger ?? defaultLog;
+    } else {
+      this.fsm = arg1;
+      this.llm = arg2 as LLMGateway;
+      this.rag = arg3 as RAGService;
+      this.log = arg4 ?? defaultLog;
+    }
   }
 
   async process(context: FSMContext): Promise<OrchestratorProcessResult> {
