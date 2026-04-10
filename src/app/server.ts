@@ -8,6 +8,7 @@
  * YCLOUD_WEBHOOK_SECRET, YCLOUD_WEBHOOK_REJECT_UNVERIFIED_IN_PRODUCTION,
  * YCLOUD_INBOUND_IDEMPOTENCY_TTL_SEC.
  * Opcional: SENTRY_DSN, SENTRY_ENV, SENTRY_BASE_RATE, SENTRY_WEBHOOK_RATE.
+ * Opcional: METRICS_ENABLED=true (Prometheus en GET /metrics).
  * PORT opcional (default 3000).
  */
 import express, {
@@ -24,6 +25,8 @@ import { EmbeddingService } from "../core/embedding/EmbeddingService";
 import { FSMEngine } from "../core/fsm/FSMEngine";
 import { IdentityManager } from "../core/identity/IdentityManager";
 import { LLMGateway } from "../core/llm/LLMGateway";
+import type { Metrics } from "../core/observability/Metrics";
+import { NoopMetrics } from "../core/observability/Metrics";
 import { Orchestrator } from "../core/orchestrator/Orchestrator";
 import { PineconeRAGAdapter } from "../core/rag/PineconeRAGAdapter";
 import { RAGService } from "../core/rag/RAGService";
@@ -36,7 +39,9 @@ import { YCloudClient } from "../infra/providers/ycloud/ycloudClient";
 import { YCloudInboundIdempotency } from "../infra/providers/ycloud/ycloudIdempotency";
 import { YCloudSender } from "../infra/providers/ycloud/ycloudSender";
 import { YCloudWebhookVerifier } from "../infra/providers/ycloud/ycloudWebhookVerifier";
+import { PrometheusMetrics } from "../infra/observability/metrics/PrometheusMetrics";
 import { getRedis } from "../infra/redis/client";
+import { registerMetricsRoute } from "./metrics/registerMetricsRoute";
 import { registerHttpRoutes } from "./routes";
 
 const log = baseLogger.child({ module: "server" });
@@ -107,6 +112,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  const metrics: Metrics =
+    process.env.METRICS_ENABLED === "true"
+      ? new PrometheusMetrics()
+      : new NoopMetrics();
+
   // --- Infra ---
   await getRedis();
 
@@ -152,7 +162,7 @@ async function main(): Promise<void> {
 
   // --- Core ---
   const fsmEngine = new FSMEngine();
-  const llmGateway = new LLMGateway({ logger: log });
+  const llmGateway = new LLMGateway({ logger: log, metrics });
   const identityManager = new IdentityManager({
     supabase: () => supabase,
     getRedis,
@@ -160,6 +170,7 @@ async function main(): Promise<void> {
   });
   const orchestrator = new Orchestrator({
     logger: log,
+    metrics,
     supabase: () => supabase,
     fsmEngine,
     llmGateway,
@@ -183,8 +194,14 @@ async function main(): Promise<void> {
     health: (_req, res) => {
       res.json({ ok: true });
     },
-    whatsappWebhook: asyncHandler(handleWhatsAppWebhook),
+    whatsappWebhook: asyncHandler((req, res) =>
+      handleWhatsAppWebhook(req, res, metrics),
+    ),
   });
+
+  if (metrics instanceof PrometheusMetrics) {
+    registerMetricsRoute(app, metrics);
+  }
 
   setupExpressErrorHandler(app);
 

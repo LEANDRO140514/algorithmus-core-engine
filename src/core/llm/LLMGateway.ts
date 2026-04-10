@@ -1,4 +1,6 @@
 import pino, { type Logger } from "pino";
+import type { Metrics } from "../observability/Metrics";
+import { NoopMetrics } from "../observability/Metrics";
 
 export type LLMTask =
   | "classify_intent"
@@ -27,6 +29,7 @@ const defaultLog = pino({
 
 export type LLMGatewayDeps = {
   logger?: Logger;
+  metrics?: Metrics;
 };
 
 function isLoggerLike(x: unknown): x is Logger {
@@ -73,6 +76,7 @@ function coerceIntent(
 
 export class LLMGateway {
   private readonly rootLog: Logger;
+  private readonly metrics: Metrics;
 
   constructor(deps: LLMGatewayDeps);
   constructor(logger?: Logger);
@@ -80,6 +84,7 @@ export class LLMGateway {
     const legacyPositional = isLoggerLike(arg);
     const deps: LLMGatewayDeps = legacyPositional ? { logger: arg } : (arg ?? {});
     this.rootLog = deps.logger ?? defaultLog;
+    this.metrics = deps.metrics ?? new NoopMetrics();
     if (legacyPositional) {
       this.rootLog.warn(
         {
@@ -106,74 +111,58 @@ export class LLMGateway {
       "llm generate",
     );
 
+    const steps = [
+      { provider: "ollama" as const, fn: () => this.callOllama(input) },
+      { provider: "openrouter" as const, fn: () => this.callOpenRouter(input) },
+      { provider: "gemini" as const, fn: () => this.callGemini(input) },
+    ];
+
     const errors: unknown[] = [];
-    try {
-      const res = await this.callOllama(input);
-      log.info(
-        {
-          step: "llm_provider_ok",
-          provider: res.provider,
-          latency_ms: res.latency_ms,
-        },
-        "llm provider ok",
-      );
-      return res;
-    } catch (e) {
-      errors.push(e);
-      log.warn(
-        {
-          step: "llm_provider_fail",
-          provider: "ollama",
-          error: e instanceof Error ? e.message : String(e),
-        },
-        "ollama falló; fallback",
-      );
-    }
-    try {
-      const res = await this.callOpenRouter(input);
-      log.info(
-        {
-          step: "llm_provider_ok",
-          provider: res.provider,
-          latency_ms: res.latency_ms,
-        },
-        "llm provider ok",
-      );
-      return res;
-    } catch (e) {
-      errors.push(e);
-      log.warn(
-        {
-          step: "llm_provider_fail",
-          provider: "openrouter",
-          error: e instanceof Error ? e.message : String(e),
-        },
-        "openrouter falló; fallback",
-      );
-    }
-    try {
-      const res = await this.callGemini(input);
-      log.info(
-        {
-          step: "llm_provider_ok",
-          provider: res.provider,
-          latency_ms: res.latency_ms,
-        },
-        "llm provider ok",
-      );
-      return res;
-    } catch (e) {
-      errors.push(e);
-      log.warn(
-        {
-          step: "llm_provider_fail",
-          provider: "gemini",
-          error: e instanceof Error ? e.message : String(e),
-        },
-        "gemini falló",
-      );
+    for (let i = 0; i < steps.length; i++) {
+      const attempt = i + 1;
+      const { provider, fn } = steps[i];
+      this.metrics.incrementCounter("llm_requests_total", 1, {
+        provider,
+        attempt: String(attempt),
+      });
+      const started = process.hrtime.bigint();
+      try {
+        const res = await fn();
+        const seconds = Number(process.hrtime.bigint() - started) / 1e9;
+        this.metrics.observeHistogram("llm_latency_seconds", seconds, {
+          provider,
+        });
+        log.info(
+          {
+            step: "llm_provider_ok",
+            provider: res.provider,
+            latency_ms: res.latency_ms,
+          },
+          "llm provider ok",
+        );
+        if (attempt > 1) {
+          this.metrics.incrementCounter("llm_fallback_success_total");
+        }
+        return res;
+      } catch (e) {
+        errors.push(e);
+        const seconds = Number(process.hrtime.bigint() - started) / 1e9;
+        this.metrics.observeHistogram("llm_latency_seconds", seconds, {
+          provider,
+        });
+        this.metrics.incrementCounter("llm_failures_total", 1, { provider });
+        log.warn(
+          {
+            step: "llm_provider_fail",
+            provider,
+            error: e instanceof Error ? e.message : String(e),
+          },
+          `${provider} falló${attempt < steps.length ? "; fallback" : ""}`,
+        );
+      }
     }
 
+    this.metrics.incrementCounter("llm_fallback_exhausted_total");
     const msg = `LLMGateway: todos los proveedores fallaron: ${errors.map(String).join(" | ")}`;
     log.error({ step: "llm_all_providers_failed" }, msg);
     throw new Error(msg);

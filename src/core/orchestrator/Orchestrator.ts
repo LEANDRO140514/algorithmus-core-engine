@@ -1,5 +1,7 @@
 import pino, { type Logger } from "pino";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Metrics } from "../observability/Metrics";
+import { NoopMetrics } from "../observability/Metrics";
 import type { ExtractedData, FSMContext, FSMResult } from "../fsm/FSMEngine";
 import { FSMEngine } from "../fsm/FSMEngine";
 import type { LLMInput, LLMResponse } from "../llm/LLMGateway";
@@ -78,6 +80,7 @@ export type OrchestratorProcessResult = {
 
 export type OrchestratorDeps = {
   logger?: Logger;
+  metrics?: Metrics;
   supabase: () => SupabaseClient;
   fsmEngine: FSMEngine;
   llmGateway: LLMGateway;
@@ -150,6 +153,7 @@ export class Orchestrator {
   private readonly rag: RAGService;
   private readonly log: Logger;
   private readonly supabase: () => SupabaseClient;
+  private readonly metrics: Metrics;
 
   constructor(deps: OrchestratorDeps);
   constructor(
@@ -170,12 +174,14 @@ export class Orchestrator {
       this.rag = arg1.ragService;
       this.log = arg1.logger ?? defaultLog;
       this.supabase = arg1.supabase;
+      this.metrics = arg1.metrics ?? new NoopMetrics();
     } else if (isLegacyOrchestratorObjectDeps(arg1)) {
       this.fsm = arg1.fsm;
       this.llm = arg1.llm;
       this.rag = arg1.rag;
       this.log = arg1.logger ?? defaultLog;
       this.supabase = createSupabaseServerClient;
+      this.metrics = new NoopMetrics();
       this.log.warn(
         {
           event: "deprecated_constructor_usage",
@@ -191,6 +197,7 @@ export class Orchestrator {
       this.rag = arg3 as RAGService;
       this.log = arg4 ?? defaultLog;
       this.supabase = createSupabaseServerClient;
+      this.metrics = new NoopMetrics();
       this.log.warn(
         {
           event: "deprecated_constructor_usage",
@@ -294,6 +301,7 @@ export class Orchestrator {
       case "query_rag": {
         let ragResult: RAGQueryResult;
         let ragQueryErrorDetail: string | undefined;
+        const ragStart = process.hrtime.bigint();
         try {
           ragResult = await this.rag.query({
             tenantId: context.tenantId,
@@ -313,9 +321,17 @@ export class Orchestrator {
             "rag retrieval error",
           );
           ragResult = { documents: [], usedTopK: RAG_TOP_K };
+        } finally {
+          const ragSecs = Number(process.hrtime.bigint() - ragStart) / 1e9;
+          this.metrics.observeHistogram("rag_latency_seconds", ragSecs);
         }
 
         if (ragResult.documents.length === 0) {
+          if (ragQueryErrorDetail) {
+            this.metrics.incrementCounter("rag_retrieval_failed_total");
+          } else {
+            this.metrics.incrementCounter("rag_no_documents_total");
+          }
           log.warn({ step: "rag_no_docs" }, "rag sin documentos");
           log.info(
             {
@@ -338,6 +354,8 @@ export class Orchestrator {
             },
           });
         }
+
+        this.metrics.incrementCounter("rag_queries_with_documents_total");
 
         const docsOrdered = [...ragResult.documents].sort(
           (a, b) => b.score - a.score,
@@ -482,7 +500,20 @@ ${context.message}
       internalDiagnostics?: OrchestratorInternalDiagnostics;
     },
   ): Promise<OrchestratorProcessResult> {
+    this.metrics.incrementCounter("fsm_transitions_total", 1, {
+      from_state: context.currentState,
+      to_state: final.nextState,
+    });
+
     const persist = await this.persistFsmState(context, final, log);
+
+    if (!persist.ok) {
+      this.metrics.incrementCounter("fsm_persistence_failures_total");
+    } else if (persist.outcome === "written") {
+      this.metrics.incrementCounter("fsm_persistence_writes_total");
+    } else {
+      this.metrics.incrementCounter("fsm_persistence_unchanged_total");
+    }
 
     const merged: OrchestratorInternalDiagnostics = {
       ...partial.internalDiagnostics,

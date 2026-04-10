@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Request, Response } from "express";
 import pino from "pino";
+import type { Metrics } from "../../core/observability/Metrics";
 import type { FSMState } from "../../core/fsm/FSMEngine";
 import type { IdentityManager } from "../../core/identity/IdentityManager";
 import type { Orchestrator } from "../../core/orchestrator/Orchestrator";
@@ -19,6 +20,9 @@ export const baseLogger = pino({
   name: "algorithmus-api",
 });
 
+const WEBHOOK_ROUTE = "/webhooks/whatsapp";
+const WHATSAPP_CHANNEL = "whatsapp";
+
 export type WhatsAppHandlerServices = {
   identityManager: IdentityManager;
   orchestrator: Orchestrator;
@@ -34,6 +38,27 @@ export function configureWhatsAppHandler(
   services: WhatsAppHandlerServices,
 ): void {
   handlerServices = services;
+}
+
+function baseLabels(tenant_id: string, reason: string) {
+  return {
+    tenant_id,
+    route: WEBHOOK_ROUTE,
+    reason,
+    channel: WHATSAPP_CHANNEL,
+  };
+}
+
+function recordWhatsAppHttpMetrics(
+  metrics: Metrics,
+  startNs: bigint,
+  tenant_id: string,
+  reason: string,
+): void {
+  const seconds = Number(process.hrtime.bigint() - startNs) / 1e9;
+  const labels = baseLabels(tenant_id, reason);
+  metrics.observeHistogram("http_request_duration_seconds", seconds, labels);
+  metrics.incrementCounter("whatsapp_requests_total", 1, labels);
 }
 
 function readTenantIdHeader(req: Request): string | undefined {
@@ -72,7 +97,9 @@ function coerceFsmState(raw: string): FSMState {
 export async function handleWhatsAppWebhook(
   req: Request,
   res: Response,
+  metrics: Metrics,
 ): Promise<void> {
+  const startNs = process.hrtime.bigint();
   const traceId = randomUUID();
   const receivedAt = new Date().toISOString();
   const tenantId = readTenantIdHeader(req);
@@ -92,6 +119,7 @@ export async function handleWhatsAppWebhook(
   );
 
   if (typeof tenantId !== "string" || !tenantId.trim()) {
+    recordWhatsAppHttpMetrics(metrics, startNs, "unknown", "missing_tenant");
     res.status(400).send("missing x-tenant-id");
     return;
   }
@@ -102,6 +130,7 @@ export async function handleWhatsAppWebhook(
       { event: "whatsapp_handler_misconfigured" },
       "handler sin servicios",
     );
+    recordWhatsAppHttpMetrics(metrics, startNs, "unknown", "misconfigured");
     res.status(503).send("service unavailable");
     return;
   }
@@ -114,6 +143,12 @@ export async function handleWhatsAppWebhook(
         reason: verify.reason,
       },
       "webhook verification failed",
+    );
+    recordWhatsAppHttpMetrics(
+      metrics,
+      startNs,
+      tenantId.trim(),
+      "unauthorized",
     );
     res.status(401).send("unauthorized");
     return;
@@ -128,6 +163,17 @@ export async function handleWhatsAppWebhook(
     log.info(
       { event: "whatsapp_webhook_ignored", reason: "not_inbound_text" },
       "webhook ignored",
+    );
+    metrics.incrementCounter(
+      "whatsapp_events_ignored_total",
+      1,
+      baseLabels(tenantId.trim(), "ignored_not_inbound"),
+    );
+    recordWhatsAppHttpMetrics(
+      metrics,
+      startNs,
+      tenantId.trim(),
+      "ignored_not_inbound",
     );
     res.status(200).send("ignored");
     return;
@@ -152,6 +198,12 @@ export async function handleWhatsAppWebhook(
     "inbound accepted before idempotency",
   );
 
+  metrics.incrementCounter(
+    "whatsapp_messages_inbound_total",
+    1,
+    baseLabels(inbound.tenantId, "inbound"),
+  );
+
   const dedup = await services.idempotency.tryAcquire(
     inbound.tenantId,
     inbound.messageId,
@@ -166,6 +218,12 @@ export async function handleWhatsAppWebhook(
       },
       "duplicate webhook ignored",
     );
+    metrics.incrementCounter(
+      "whatsapp_duplicates_total",
+      1,
+      baseLabels(inbound.tenantId, "duplicate"),
+    );
+    recordWhatsAppHttpMetrics(metrics, startNs, inbound.tenantId, "duplicate");
     res.status(200).send("duplicate");
     return;
   }
@@ -238,6 +296,12 @@ export async function handleWhatsAppWebhook(
       traceId,
     });
 
+    metrics.incrementCounter(
+      "whatsapp_outbound_messages_total",
+      1,
+      baseLabels(inbound.tenantId, "sent"),
+    );
+    recordWhatsAppHttpMetrics(metrics, startNs, inbound.tenantId, "ok");
     res.status(200).send("ok");
   } catch (err) {
     runLog.error(
@@ -246,6 +310,11 @@ export async function handleWhatsAppWebhook(
         error: err instanceof Error ? err.message : String(err),
       },
       "whatsapp handler error",
+    );
+    metrics.incrementCounter(
+      "whatsapp_handler_errors_total",
+      1,
+      baseLabels(inbound.tenantId, "error"),
     );
     captureHandlerException(
       err,
@@ -256,6 +325,7 @@ export async function handleWhatsAppWebhook(
         lead_id: leadIdForScope,
       },
     );
+    recordWhatsAppHttpMetrics(metrics, startNs, inbound.tenantId, "error");
     res.status(500).send("internal error");
   }
 }
