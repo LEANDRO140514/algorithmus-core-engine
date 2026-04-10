@@ -1,5 +1,5 @@
 import pino, { type Logger } from "pino";
-import type { Metrics } from "../observability/Metrics";
+import type { MetricLabels, Metrics } from "../observability/Metrics";
 import { NoopMetrics } from "../observability/Metrics";
 
 export type LLMTask =
@@ -12,6 +12,8 @@ export type LLMInput = {
   task: LLMTask;
   input: string;
   traceId?: string;
+  /** Para métricas multi-tenant (Prometheus); no afecta al proveedor. */
+  tenantId?: string;
 };
 
 export type LLMResponse = {
@@ -50,6 +52,11 @@ function abortAfter(ms: number): AbortSignal {
   const c = new AbortController();
   setTimeout(() => c.abort(new Error("timeout")), ms);
   return c.signal;
+}
+
+function metricsTenantLabel(input: LLMInput): MetricLabels {
+  const tid = input.tenantId?.trim();
+  return { tenant_id: tid && tid.length > 0 ? tid : "unknown" };
 }
 
 function tryParseJsonObject(text: string): Record<string, unknown> | null {
@@ -118,10 +125,12 @@ export class LLMGateway {
     ];
 
     const errors: unknown[] = [];
+    const tenant = metricsTenantLabel(input);
     for (let i = 0; i < steps.length; i++) {
       const attempt = i + 1;
       const { provider, fn } = steps[i];
       this.metrics.incrementCounter("llm_requests_total", 1, {
+        ...tenant,
         provider,
         attempt: String(attempt),
       });
@@ -130,6 +139,7 @@ export class LLMGateway {
         const res = await fn();
         const seconds = Number(process.hrtime.bigint() - started) / 1e9;
         this.metrics.observeHistogram("llm_latency_seconds", seconds, {
+          ...tenant,
           provider,
         });
         log.info(
@@ -141,16 +151,20 @@ export class LLMGateway {
           "llm provider ok",
         );
         if (attempt > 1) {
-          this.metrics.incrementCounter("llm_fallback_success_total");
+          this.metrics.incrementCounter("llm_fallback_success_total", 1, tenant);
         }
         return res;
       } catch (e) {
         errors.push(e);
         const seconds = Number(process.hrtime.bigint() - started) / 1e9;
         this.metrics.observeHistogram("llm_latency_seconds", seconds, {
+          ...tenant,
           provider,
         });
-        this.metrics.incrementCounter("llm_failures_total", 1, { provider });
+        this.metrics.incrementCounter("llm_failures_total", 1, {
+          ...tenant,
+          provider,
+        });
         log.warn(
           {
             step: "llm_provider_fail",
@@ -162,7 +176,7 @@ export class LLMGateway {
       }
     }
 
-    this.metrics.incrementCounter("llm_fallback_exhausted_total");
+    this.metrics.incrementCounter("llm_fallback_exhausted_total", 1, tenant);
     const msg = `LLMGateway: todos los proveedores fallaron: ${errors.map(String).join(" | ")}`;
     log.error({ step: "llm_all_providers_failed" }, msg);
     throw new Error(msg);
