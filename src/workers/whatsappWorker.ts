@@ -200,6 +200,17 @@ async function main(): Promise<void> {
           { module: "whatsapp_worker", step: "inbound_job" },
           { trace_id: traceId, tenant_id: tenantId, lead_id: leadId },
         );
+        if (!(error instanceof UnrecoverableError)) {
+          const made = job.attemptsMade ?? 0;
+          const maxAttempts = job.opts.attempts ?? 1;
+          if (made + 1 < maxAttempts) {
+            ctx.metrics.incrementCounter("queue_jobs_total", 1, {
+              queue: WHATSAPP_INBOUND_QUEUE,
+              tenant_id: tenantId,
+              status: "retry",
+            });
+          }
+        }
         throw error;
       }
     },
