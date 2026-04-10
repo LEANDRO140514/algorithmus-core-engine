@@ -530,7 +530,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(rag_no_documents_total[5m])) / (sum(rate(rag_no_documents_total[5m])) + sum(rate(rag_queries_with_documents_total[5m])))",
+          "expr": "sum(rate(rag_no_documents_total[5m])) / sum(rate(rag_queries_total[5m]))",
           "legendFormat": "no docs share",
           "refId": "A"
         }

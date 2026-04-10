@@ -1,12 +1,14 @@
 {
   "scripts": {
     "build": "tsc",
-    "start": "node dist/app/server.js"
+    "start": "node dist/app/server.js",
+    "worker:whatsapp": "node dist/workers/whatsappWorker.js"
   },
   "dependencies": {
     "@pinecone-database/pinecone": "^7.1.0",
     "@sentry/node": "^8.55.1",
     "@supabase/supabase-js": "^2.101.1",
+    "bullmq": "^5.73.3",
     "express": "^4.22.1",
     "pino": "^10.3.1",
     "prom-client": "^15.1.3",
