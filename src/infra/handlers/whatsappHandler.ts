@@ -2,16 +2,13 @@ import { randomUUID } from "node:crypto";
 import type { Request, Response } from "express";
 import pino from "pino";
 import type { Metrics } from "../../core/observability/Metrics";
-import type { FSMState } from "../../core/fsm/FSMEngine";
 import type { IdentityManager } from "../../core/identity/IdentityManager";
-import type { Orchestrator } from "../../core/orchestrator/Orchestrator";
+import type { WhatsAppInboundJobProducer } from "../queue/queueClient";
 import type { YCloudInboundIdempotency } from "../providers/ycloud/ycloudIdempotency";
-import type { YCloudSender } from "../providers/ycloud/ycloudSender";
 import type { YCloudWebhookVerifier } from "../providers/ycloud/ycloudWebhookVerifier";
 import { parseYCloudInboundWhatsAppText } from "../providers/ycloud/ycloudWebhookParser";
 import {
   captureHandlerException,
-  captureInfraMessage,
   setSentryRequestContext,
 } from "../observability/sentry";
 
@@ -25,10 +22,9 @@ const WHATSAPP_CHANNEL = "whatsapp";
 
 export type WhatsAppHandlerServices = {
   identityManager: IdentityManager;
-  orchestrator: Orchestrator;
   webhookVerifier: YCloudWebhookVerifier;
   idempotency: YCloudInboundIdempotency;
-  sender: YCloudSender;
+  inboundJobProducer: WhatsAppInboundJobProducer;
 };
 
 let handlerServices: WhatsAppHandlerServices | null = null;
@@ -78,21 +74,9 @@ function previewBody(raw: unknown): string {
   }
 }
 
-const FSM_STATES: readonly FSMState[] = [
-  "INIT",
-  "QUALIFYING",
-  "SUPPORT_RAG",
-  "BOOKING",
-  "HUMAN_HANDOVER",
-];
-
-function coerceFsmState(raw: string): FSMState {
-  return FSM_STATES.includes(raw as FSMState) ? (raw as FSMState) : "INIT";
-}
-
 /**
- * Procesamiento síncrono en el request: YCloud/LLM/RAG pueden superar el timeout del proveedor.
- * Evolución recomendada: responder 200 tras encolar job y procesar en worker.
+ * Webhook corto: validación, idempotencia inbound, identidad, encolado BullMQ.
+ * Orchestrator + envío YCloud se ejecutan en `src/workers/whatsappWorker.ts`.
  */
 export async function handleWhatsAppWebhook(
   req: Request,
@@ -255,54 +239,33 @@ export async function handleWhatsAppWebhook(
       lead_id: lead.id,
     });
 
-    const result = await services.orchestrator.process({
+    const receivedMs = Date.parse(inbound.receivedAt);
+    await services.inboundJobProducer.add({
       tenantId: inbound.tenantId,
       leadId: lead.id,
-      message: inbound.text,
-      currentState: coerceFsmState(lead.fsm_state),
+      currentState: lead.fsm_state,
       traceId,
+      inboundMessage: {
+        messageId: inbound.messageId,
+        from: inbound.externalUserId,
+        text: inbound.text,
+        channel: inbound.channel,
+        ...(Number.isFinite(receivedMs) ? { timestamp: receivedMs } : {}),
+      },
     });
-
-    if (result.fsmPersisted === false) {
-      captureInfraMessage("FSM state persist failed after orchestrator", {
-        tags: {
-          module: "whatsapp_handler",
-          step: "orchestrator_fsm_persist",
-        },
-        extra: {
-          trace_id: traceId,
-          tenant_id: inbound.tenantId,
-          lead_id: lead.id,
-          persist_error:
-            result.internalDiagnostics?.persistError ?? "unknown",
-        },
-        level: "error",
-      });
-    }
 
     runLog.info(
-      {
-        event: "whatsapp_orchestrator_completed",
-        message_preview: result.messageToSend.slice(0, 80),
-      },
-      "orchestrator completed",
+      { event: "whatsapp_inbound_enqueued", message_id: inbound.messageId },
+      "inbound enqueued for async processing",
     );
-
-    await services.sender.sendText({
-      channel: "whatsapp",
-      to: inbound.externalUserId,
-      text: result.messageToSend,
-      tenantId: inbound.tenantId,
-      traceId,
-    });
 
     metrics.incrementCounter(
-      "whatsapp_outbound_messages_total",
+      "whatsapp_inbound_jobs_enqueued_total",
       1,
-      baseLabels(inbound.tenantId, "sent"),
+      baseLabels(inbound.tenantId, "queued"),
     );
-    recordWhatsAppHttpMetrics(metrics, startNs, inbound.tenantId, "ok");
-    res.status(200).send("ok");
+    recordWhatsAppHttpMetrics(metrics, startNs, inbound.tenantId, "queued");
+    res.status(200).json({ ok: true });
   } catch (err) {
     runLog.error(
       {

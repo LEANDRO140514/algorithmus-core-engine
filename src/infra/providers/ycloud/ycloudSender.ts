@@ -34,7 +34,8 @@ export class YCloudSender {
     this.defaultFrom = deps.defaultFrom;
   }
 
-  async sendText(message: OutboundChannelMessage): Promise<void> {
+  /** @returns `true` si YCloud aceptó el envío; `false` si la API falló (no lanza). */
+  async sendText(message: OutboundChannelMessage): Promise<boolean> {
     const log = this.log.child({
       trace_id: message.traceId,
       tenant_id: message.tenantId,
@@ -76,7 +77,7 @@ export class YCloudSender {
         },
         "whatsapp outbound failed",
       );
-      return;
+      return false;
     }
 
     log.info(
@@ -90,5 +91,6 @@ export class YCloudSender {
       },
       "whatsapp outbound sent",
     );
+    return true;
   }
 }
