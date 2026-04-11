@@ -13,6 +13,7 @@ import { YCloudClient } from "../infra/providers/ycloud/ycloudClient";
 import { YCloudInboundIdempotency } from "../infra/providers/ycloud/ycloudIdempotency";
 import { YCloudSender } from "../infra/providers/ycloud/ycloudSender";
 import { YCloudWebhookVerifier } from "../infra/providers/ycloud/ycloudWebhookVerifier";
+import { BullmqQueueDepthExporter } from "../infra/observability/bullmqQueueDepthExporter";
 import { PrometheusMetrics } from "../infra/observability/metrics/PrometheusMetrics";
 import { getRedis } from "../infra/redis/client";
 import {
@@ -21,7 +22,22 @@ import {
   createWhatsAppInboundQueue,
   type WhatsAppInboundJobProducer,
 } from "../infra/queue/queueClient";
+import { WHATSAPP_INBOUND_QUEUE } from "../infra/queue/jobTypes";
+import { getRedisUrl } from "../config/redisUrl";
 import { requireEnv, readEnvOptional, readPositiveInt } from "./envHelpers";
+
+/** Default 15000. Set to `0` to disable queue depth polling. */
+function readQueueDepthIntervalMs(defaultMs: number): number {
+  const raw = process.env.METRICS_QUEUE_DEPTH_INTERVAL_MS?.trim();
+  if (raw === undefined || raw === "") {
+    return defaultMs;
+  }
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    return defaultMs;
+  }
+  return n;
+}
 
 export type AppContext = {
   orchestrator: Orchestrator;
@@ -50,7 +66,7 @@ export async function createAppContext(
 
   const supabaseUrl = requireEnv(log, "SUPABASE_URL");
   const supabaseServiceRoleKey = requireEnv(log, "SUPABASE_SERVICE_ROLE_KEY");
-  const redisUrl = requireEnv(log, "REDIS_URL");
+  const redisUrl = getRedisUrl();
   requireEnv(log, "OPENAI_API_KEY");
   requireEnv(log, "PINECONE_API_KEY");
   requireEnv(log, "PINECONE_INDEX_HOST");
@@ -74,9 +90,9 @@ export async function createAppContext(
     "true";
 
   const metrics: Metrics =
-    process.env.METRICS_ENABLED === "true"
-      ? new PrometheusMetrics()
-      : new NoopMetrics();
+    process.env.METRICS_ENABLED === "false"
+      ? new NoopMetrics()
+      : new PrometheusMetrics();
 
   const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
     auth: {
@@ -140,7 +156,22 @@ export async function createAppContext(
     const bullConn = createBullMqConnection(redisUrl);
     const queue = createWhatsAppInboundQueue(bullConn);
     inboundJobProducer = createWhatsAppInboundJobProducer(queue);
+
+    let depthExporter: BullmqQueueDepthExporter | undefined;
+    const queueDepthIntervalMs = readQueueDepthIntervalMs(15_000);
+    if (queueDepthIntervalMs > 0 && metrics instanceof PrometheusMetrics) {
+      depthExporter = new BullmqQueueDepthExporter({
+        queue,
+        metrics,
+        log,
+        queueLabel: WHATSAPP_INBOUND_QUEUE,
+        intervalMs: queueDepthIntervalMs,
+      });
+      depthExporter.start();
+    }
+
     queueCloser = async () => {
+      await depthExporter?.stop();
       await queue.close();
       await bullConn.quit();
     };

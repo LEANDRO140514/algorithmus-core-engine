@@ -1,17 +1,8 @@
 import { createClient } from "redis";
+import { getRedisUrl } from "../../config/redisUrl";
 
 let client: ReturnType<typeof createClient> | null = null;
 let connecting: Promise<ReturnType<typeof createClient>> | undefined;
-
-function requireRedisUrl(): string {
-  const url = process.env.REDIS_URL;
-  if (typeof url !== "string" || !url.trim()) {
-    throw new Error(
-      "[redis] REDIS_URL no está definida o está vacía en el entorno.",
-    );
-  }
-  return url.trim();
-}
 
 /**
  * Cliente Redis singleton (lazy connect). Namespacing por tenant en capas superiores.
@@ -21,7 +12,7 @@ export async function getRedis(): Promise<ReturnType<typeof createClient>> {
   if (connecting) return connecting;
 
   connecting = (async () => {
-    const c = createClient({ url: requireRedisUrl() });
+    const c = createClient({ url: getRedisUrl() });
     c.on("error", (err) => {
       console.error("[redis] error de cliente", err);
     });

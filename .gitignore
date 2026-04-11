@@ -1,3 +1,6 @@
 node_modules/
 .env
 dist/
+
+# Pinecone + Cursor: guía local (no versionar)
+AGENTS.md

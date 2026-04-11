@@ -1,7 +1,10 @@
+import "./loadEnv";
+
 /**
  * Composition root: wiring, Express, listen. Sin lógica de negocio.
  *
- * Env críticas: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, REDIS_URL,
+ * Env críticas: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, REDIS_URL (en producción;
+ *   en desarrollo, por defecto redis://localhost:6379 si falta),
  * OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_HOST,
  * YCLOUD_API_KEY, YCLOUD_WHATSAPP_FROM.
  * Opcionales: YCLOUD_BASE_URL (default https://api.ycloud.com/v2), YCLOUD_REQUEST_TIMEOUT_MS,
@@ -9,7 +12,7 @@
  * YCLOUD_INBOUND_IDEMPOTENCY_TTL_SEC.
  * Opcional: YCLOUD_OUTBOUND_IDEMPOTENCY_TTL_SEC (worker, default 300).
  * Opcional: SENTRY_DSN, SENTRY_ENV, SENTRY_BASE_RATE, SENTRY_WEBHOOK_RATE.
- * Opcional: METRICS_ENABLED=true (Prometheus en GET /metrics).
+ * Opcional: METRICS_ENABLED=false desactiva Prometheus y GET /metrics (default: métricas activas).
  * PORT opcional (default 3000).
  *
  * Procesamiento WhatsApp inbound: encolado BullMQ; ejecutar worker aparte:

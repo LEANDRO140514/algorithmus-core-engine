@@ -1,4 +1,6 @@
+import "../app/loadEnv";
 import { UnrecoverableError, Worker } from "bullmq";
+import { getRedisUrl } from "../config/redisUrl";
 import { createAppContext } from "../app/compositionRoot";
 import { readPositiveInt } from "../app/envHelpers";
 import { baseLogger } from "../infra/handlers/whatsappHandler";
@@ -36,11 +38,7 @@ async function main(): Promise<void> {
     300,
   );
 
-  const redisUrl = process.env.REDIS_URL?.trim();
-  if (!redisUrl) {
-    log.error({ event: "env_missing", name: "REDIS_URL" }, "missing REDIS_URL");
-    process.exit(1);
-  }
+  const redisUrl = getRedisUrl();
 
   const ctx = await createAppContext(log, { withInboundQueue: false });
   const connection = createBullMqConnection(redisUrl);
