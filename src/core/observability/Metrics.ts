@@ -14,6 +14,7 @@ export interface Metrics {
     valueSeconds: number,
     labels?: MetricLabels,
   ): void;
+  setGauge(name: string, value: number, labels?: MetricLabels): void;
 }
 
 export class NoopMetrics implements Metrics {
@@ -28,4 +29,6 @@ export class NoopMetrics implements Metrics {
     _valueSeconds: number,
     _labels?: MetricLabels,
   ): void {}
+
+  setGauge(_name: string, _value: number, _labels?: MetricLabels): void {}
 }

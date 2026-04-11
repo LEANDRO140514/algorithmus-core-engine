@@ -1,5 +1,6 @@
 import {
   Counter,
+  Gauge,
   Histogram,
   Registry,
   type RegistryContentType,
@@ -41,9 +42,13 @@ export class PrometheusMetrics implements Metrics {
 
   private readonly histograms = new Map<string, Histogram<string>>();
 
+  private readonly gauges = new Map<string, Gauge<string>>();
+
   private readonly counterLabelKeys = new Map<string, string[]>();
 
   private readonly histogramLabelKeys = new Map<string, string[]>();
+
+  private readonly gaugeLabelKeys = new Map<string, string[]>();
 
   get contentType(): string {
     return this.registry.contentType;
@@ -84,6 +89,17 @@ export class PrometheusMetrics implements Metrics {
       h.observe(valueSeconds);
     } else {
       h.observe(normalized, valueSeconds);
+    }
+  }
+
+  setGauge(name: string, value: number, labels?: MetricLabels): void {
+    const normalized = normalizeLabelRecord(labels);
+    const keys = sortedLabelKeys(normalized);
+    const g = this.getOrCreateGauge(name, keys);
+    if (keys.length === 0) {
+      g.set(value);
+    } else {
+      g.set(normalized, value);
     }
   }
 
@@ -152,5 +168,38 @@ export class PrometheusMetrics implements Metrics {
     });
     this.histograms.set(key, h);
     return h;
+  }
+
+  private getOrCreateGauge(
+    name: string,
+    labelKeys: string[],
+  ): Gauge<string> {
+    const key = cacheKey(name, labelKeys);
+    const existing = this.gauges.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const prev = this.gaugeLabelKeys.get(name);
+    if (prev !== undefined) {
+      const a = prev.join("|");
+      const b = labelKeys.join("|");
+      if (a !== b) {
+        throw new Error(
+          `metrics: label keys for gauge "${name}" mismatch: [${b}] vs registered [${a}]`,
+        );
+      }
+    } else {
+      this.gaugeLabelKeys.set(name, labelKeys);
+    }
+
+    const g = new Gauge({
+      name,
+      help: `Gauge ${name}`,
+      labelNames: labelKeys,
+      registers: [this.registry],
+    });
+    this.gauges.set(key, g);
+    return g;
   }
 }
