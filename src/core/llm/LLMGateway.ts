@@ -129,10 +129,10 @@ export class LLMGateway {
     for (let i = 0; i < steps.length; i++) {
       const attempt = i + 1;
       const { provider, fn } = steps[i];
+      const model = provider;
       this.metrics.incrementCounter("llm_requests_total", 1, {
         ...tenant,
-        provider,
-        attempt: String(attempt),
+        model,
       });
       const started = process.hrtime.bigint();
       try {
@@ -140,7 +140,7 @@ export class LLMGateway {
         const seconds = Number(process.hrtime.bigint() - started) / 1e9;
         this.metrics.observeHistogram("llm_latency_seconds", seconds, {
           ...tenant,
-          provider,
+          model,
         });
         log.info(
           {
@@ -152,6 +152,10 @@ export class LLMGateway {
         );
         if (attempt > 1) {
           this.metrics.incrementCounter("llm_fallback_success_total", 1, tenant);
+          this.metrics.incrementCounter("llm_fallback_total", 1, {
+            ...tenant,
+            outcome: "recovered",
+          });
         }
         return res;
       } catch (e) {
@@ -159,11 +163,11 @@ export class LLMGateway {
         const seconds = Number(process.hrtime.bigint() - started) / 1e9;
         this.metrics.observeHistogram("llm_latency_seconds", seconds, {
           ...tenant,
-          provider,
+          model,
         });
         this.metrics.incrementCounter("llm_failures_total", 1, {
           ...tenant,
-          provider,
+          model,
         });
         log.warn(
           {
@@ -177,6 +181,10 @@ export class LLMGateway {
     }
 
     this.metrics.incrementCounter("llm_fallback_exhausted_total", 1, tenant);
+    this.metrics.incrementCounter("llm_fallback_total", 1, {
+      ...tenant,
+      outcome: "exhausted",
+    });
     const msg = `LLMGateway: todos los proveedores fallaron: ${errors.map(String).join(" | ")}`;
     log.error({ step: "llm_all_providers_failed" }, msg);
     throw new Error(msg);

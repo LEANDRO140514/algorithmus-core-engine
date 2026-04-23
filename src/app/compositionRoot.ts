@@ -14,7 +14,7 @@ import { YCloudInboundIdempotency } from "../infra/providers/ycloud/ycloudIdempo
 import { YCloudSender } from "../infra/providers/ycloud/ycloudSender";
 import { YCloudWebhookVerifier } from "../infra/providers/ycloud/ycloudWebhookVerifier";
 import { BullmqQueueDepthExporter } from "../infra/observability/bullmqQueueDepthExporter";
-import { PrometheusMetrics } from "../infra/observability/metrics/PrometheusMetrics";
+import { PrometheusMetricsAdapter } from "../infra/observability/metrics/PrometheusMetricsAdapter";
 import { getRedis } from "../infra/redis/client";
 import {
   createBullMqConnection,
@@ -92,7 +92,7 @@ export async function createAppContext(
   const metrics: Metrics =
     process.env.METRICS_ENABLED === "false"
       ? new NoopMetrics()
-      : new PrometheusMetrics();
+      : new PrometheusMetricsAdapter();
 
   const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
     auth: {
@@ -131,6 +131,7 @@ export async function createAppContext(
   const rag = new RAGService({
     logger: log,
     adapter: pineconeRag,
+    metrics,
   });
 
   const fsmEngine = new FSMEngine();
@@ -159,7 +160,7 @@ export async function createAppContext(
 
     let depthExporter: BullmqQueueDepthExporter | undefined;
     const queueDepthIntervalMs = readQueueDepthIntervalMs(15_000);
-    if (queueDepthIntervalMs > 0 && metrics instanceof PrometheusMetrics) {
+    if (queueDepthIntervalMs > 0 && metrics instanceof PrometheusMetricsAdapter) {
       depthExporter = new BullmqQueueDepthExporter({
         queue,
         metrics,

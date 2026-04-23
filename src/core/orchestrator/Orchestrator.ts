@@ -299,12 +299,8 @@ export class Orchestrator {
       }
 
       case "query_rag": {
-        const ragTenant = { tenant_id: context.tenantId };
-        this.metrics.incrementCounter("rag_queries_total", 1, ragTenant);
-
         let ragResult: RAGQueryResult;
         let ragQueryErrorDetail: string | undefined;
-        const ragStart = process.hrtime.bigint();
         try {
           ragResult = await this.rag.query({
             tenantId: context.tenantId,
@@ -324,17 +320,9 @@ export class Orchestrator {
             "rag retrieval error",
           );
           ragResult = { documents: [], usedTopK: RAG_TOP_K };
-        } finally {
-          const ragSecs = Number(process.hrtime.bigint() - ragStart) / 1e9;
-          this.metrics.observeHistogram("rag_latency_seconds", ragSecs, ragTenant);
         }
 
         if (ragResult.documents.length === 0) {
-          if (ragQueryErrorDetail) {
-            this.metrics.incrementCounter("rag_retrieval_failed_total", 1, ragTenant);
-          } else {
-            this.metrics.incrementCounter("rag_no_documents_total", 1, ragTenant);
-          }
           log.warn({ step: "rag_no_docs" }, "rag sin documentos");
           log.info(
             {
@@ -357,12 +345,6 @@ export class Orchestrator {
             },
           });
         }
-
-        this.metrics.incrementCounter(
-          "rag_queries_with_documents_total",
-          1,
-          ragTenant,
-        );
 
         const docsOrdered = [...ragResult.documents].sort(
           (a, b) => b.score - a.score,

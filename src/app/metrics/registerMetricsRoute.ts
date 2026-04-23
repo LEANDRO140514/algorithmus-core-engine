@@ -1,9 +1,9 @@
 import type { Express, RequestHandler } from "express";
-import type { PrometheusMetrics } from "../../infra/observability/metrics/PrometheusMetrics";
+import type { PrometheusMetricsAdapter } from "../../infra/observability/metrics/PrometheusMetricsAdapter";
 
 export function registerMetricsRoute(
   app: Express,
-  prometheus: PrometheusMetrics,
+  prometheus: PrometheusMetricsAdapter,
 ): void {
   const handler: RequestHandler = async (_req, res, next) => {
     try {

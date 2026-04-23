@@ -17,16 +17,8 @@ import {
 import { createBullMqConnection } from "../infra/queue/queueClient";
 import { getRedis } from "../infra/redis/client";
 
-const WEBHOOK_ROUTE = "/webhooks/whatsapp";
-const WHATSAPP_CHANNEL = "whatsapp";
-
-function outboundMetricLabels(tenant_id: string) {
-  return {
-    tenant_id,
-    route: WEBHOOK_ROUTE,
-    reason: "sent",
-    channel: WHATSAPP_CHANNEL,
-  };
+function outboundMessageLabels(tenant_id: string) {
+  return { tenant_id, outcome: "success" as const };
 }
 
 async function main(): Promise<void> {
@@ -99,7 +91,7 @@ async function main(): Promise<void> {
       ctx.metrics.incrementCounter("queue_jobs_total", 1, {
         queue: WHATSAPP_INBOUND_QUEUE,
         tenant_id: tenantId,
-        status: "started",
+        outcome: "started",
       });
 
       logger.info(
@@ -161,8 +153,12 @@ async function main(): Promise<void> {
             ctx.metrics.incrementCounter(
               "whatsapp_outbound_messages_total",
               1,
-              outboundMetricLabels(tenantId),
+              outboundMessageLabels(tenantId),
             );
+            ctx.metrics.incrementCounter("messages_total", 1, {
+              tenant_id: tenantId,
+              direction: "outbound",
+            });
           } catch (sendErr) {
             await redis.del(outboundKey).catch(() => undefined);
             throw sendErr;
@@ -173,12 +169,12 @@ async function main(): Promise<void> {
         ctx.metrics.observeHistogram("queue_job_duration_seconds", duration, {
           queue: WHATSAPP_INBOUND_QUEUE,
           tenant_id: tenantId,
-          status: "completed",
+          outcome: "completed",
         });
         ctx.metrics.incrementCounter("queue_jobs_total", 1, {
           queue: WHATSAPP_INBOUND_QUEUE,
           tenant_id: tenantId,
-          status: "completed",
+          outcome: "completed",
         });
 
         logger.info(
@@ -205,7 +201,7 @@ async function main(): Promise<void> {
             ctx.metrics.incrementCounter("queue_jobs_total", 1, {
               queue: WHATSAPP_INBOUND_QUEUE,
               tenant_id: tenantId,
-              status: "retry",
+              outcome: "retry",
             });
           }
         }
@@ -226,7 +222,7 @@ async function main(): Promise<void> {
     ctx.metrics.incrementCounter("queue_jobs_total", 1, {
       queue: WHATSAPP_INBOUND_QUEUE,
       tenant_id: job.data.tenantId,
-      status: "failed",
+      outcome: "failed",
     });
     log.error(
       {

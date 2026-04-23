@@ -32,7 +32,7 @@ import {
   configureWhatsAppHandler,
   handleWhatsAppWebhook,
 } from "../infra/handlers/whatsappHandler";
-import { PrometheusMetrics } from "../infra/observability/metrics/PrometheusMetrics";
+import { PrometheusMetricsAdapter } from "../infra/observability/metrics/PrometheusMetricsAdapter";
 import type { Metrics } from "../core/observability/Metrics";
 import { registerMetricsRoute } from "./metrics/registerMetricsRoute";
 import { registerHttpRoutes } from "./routes";
@@ -89,7 +89,7 @@ async function main(): Promise<void> {
     ),
   });
 
-  if (metrics instanceof PrometheusMetrics) {
+  if (metrics instanceof PrometheusMetricsAdapter) {
     registerMetricsRoute(app, metrics);
   }
 

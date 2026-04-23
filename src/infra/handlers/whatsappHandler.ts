@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Request, Response } from "express";
 import pino from "pino";
-import type { Metrics } from "../../core/observability/Metrics";
+import type { MetricsService } from "../observability/metrics/MetricsService";
 import type { IdentityManager } from "../../core/identity/IdentityManager";
 import type { WhatsAppInboundJobProducer } from "../queue/queueClient";
 import type { YCloudInboundIdempotency } from "../providers/ycloud/ycloudIdempotency";
@@ -16,9 +16,6 @@ export const baseLogger = pino({
   level: process.env.LOG_LEVEL ?? "info",
   name: "algorithmus-api",
 });
-
-const WEBHOOK_ROUTE = "/webhooks/whatsapp";
-const WHATSAPP_CHANNEL = "whatsapp";
 
 export type WhatsAppHandlerServices = {
   identityManager: IdentityManager;
@@ -36,24 +33,40 @@ export function configureWhatsAppHandler(
   handlerServices = services;
 }
 
-function baseLabels(tenant_id: string, reason: string) {
-  return {
-    tenant_id,
-    route: WEBHOOK_ROUTE,
-    reason,
-    channel: WHATSAPP_CHANNEL,
-  };
+/** Outcome HTTP canónico (Grafana / SLOs). */
+export type HttpRequestOutcome = "success" | "error" | "ignored";
+
+function reasonToHttpOutcome(internalReason: string): HttpRequestOutcome {
+  switch (internalReason) {
+    case "queued":
+      return "success";
+    case "ignored_not_inbound":
+    case "duplicate":
+      return "ignored";
+    case "missing_tenant":
+    case "misconfigured":
+    case "unauthorized":
+    case "error":
+    default:
+      return "error";
+  }
+}
+
+/** Labels estables: solo `tenant_id` + `outcome` (sin route/channel/trace). */
+function tenantOutcomeLabels(tenant_id: string, outcome: HttpRequestOutcome) {
+  return { tenant_id, outcome };
 }
 
 function recordWhatsAppHttpMetrics(
-  metrics: Metrics,
+  metrics: MetricsService,
   startNs: bigint,
   tenant_id: string,
-  reason: string,
+  internalReason: string,
 ): void {
   const seconds = Number(process.hrtime.bigint() - startNs) / 1e9;
-  const labels = baseLabels(tenant_id, reason);
-  metrics.observeHistogram("http_request_duration_seconds", seconds, labels);
+  const outcome = reasonToHttpOutcome(internalReason);
+  const labels = tenantOutcomeLabels(tenant_id, outcome);
+  metrics.observeHistogram("request_duration_seconds", seconds, labels);
   metrics.incrementCounter("whatsapp_requests_total", 1, labels);
 }
 
@@ -81,7 +94,7 @@ function previewBody(raw: unknown): string {
 export async function handleWhatsAppWebhook(
   req: Request,
   res: Response,
-  metrics: Metrics,
+  metrics: MetricsService,
 ): Promise<void> {
   const startNs = process.hrtime.bigint();
   const traceId = randomUUID();
@@ -151,7 +164,7 @@ export async function handleWhatsAppWebhook(
     metrics.incrementCounter(
       "whatsapp_events_ignored_total",
       1,
-      baseLabels(tenantId.trim(), "ignored_not_inbound"),
+      tenantOutcomeLabels(tenantId.trim(), "ignored"),
     );
     recordWhatsAppHttpMetrics(
       metrics,
@@ -182,12 +195,6 @@ export async function handleWhatsAppWebhook(
     "inbound accepted before idempotency",
   );
 
-  metrics.incrementCounter(
-    "whatsapp_messages_inbound_total",
-    1,
-    baseLabels(inbound.tenantId, "inbound"),
-  );
-
   const dedup = await services.idempotency.tryAcquire(
     inbound.tenantId,
     inbound.messageId,
@@ -205,12 +212,22 @@ export async function handleWhatsAppWebhook(
     metrics.incrementCounter(
       "whatsapp_duplicates_total",
       1,
-      baseLabels(inbound.tenantId, "duplicate"),
+      tenantOutcomeLabels(inbound.tenantId, "ignored"),
     );
     recordWhatsAppHttpMetrics(metrics, startNs, inbound.tenantId, "duplicate");
     res.status(200).send("duplicate");
     return;
   }
+
+  metrics.incrementCounter(
+    "whatsapp_messages_inbound_total",
+    1,
+    tenantOutcomeLabels(inbound.tenantId, "success"),
+  );
+  metrics.incrementCounter("messages_total", 1, {
+    tenant_id: inbound.tenantId,
+    direction: "inbound",
+  });
 
   setSentryRequestContext({
     trace_id: traceId,
@@ -262,7 +279,7 @@ export async function handleWhatsAppWebhook(
     metrics.incrementCounter(
       "whatsapp_inbound_jobs_enqueued_total",
       1,
-      baseLabels(inbound.tenantId, "queued"),
+      tenantOutcomeLabels(inbound.tenantId, "success"),
     );
     recordWhatsAppHttpMetrics(metrics, startNs, inbound.tenantId, "queued");
     res.status(200).json({ ok: true });
@@ -277,7 +294,7 @@ export async function handleWhatsAppWebhook(
     metrics.incrementCounter(
       "whatsapp_handler_errors_total",
       1,
-      baseLabels(inbound.tenantId, "error"),
+      tenantOutcomeLabels(inbound.tenantId, "error"),
     );
     captureHandlerException(
       err,

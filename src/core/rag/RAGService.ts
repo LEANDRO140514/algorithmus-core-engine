@@ -1,4 +1,5 @@
 import pino, { type Logger } from "pino";
+import type { Metrics } from "../observability/Metrics";
 
 export type RAGQueryInput = {
   tenantId: string;
@@ -38,6 +39,8 @@ export type RAGServiceDeps = {
   adapter?: RAGVectorAdapter;
   /** Alias de función; preferir `adapter` cuando sea instancia con `.query`. */
   vectorSearch?: (input: RAGQueryInput) => Promise<RAGDocument[]>;
+  /** Métricas (puerto `Metrics`; inyectado desde composition root). */
+  metrics?: Metrics;
 };
 
 function isLoggerLike(x: unknown): x is Logger {
@@ -51,7 +54,7 @@ function isLoggerLike(x: unknown): x is Logger {
 
 function resolveRagDeps(
   arg1?: Logger | RAGServiceDeps,
-  arg2?: Pick<RAGServiceDeps, "adapter" | "vectorSearch">,
+  arg2?: Pick<RAGServiceDeps, "adapter" | "vectorSearch" | "metrics">,
 ): RAGServiceDeps {
   if (arg2 !== undefined) {
     if (!isLoggerLike(arg1)) {
@@ -75,10 +78,17 @@ export class RAGService {
   private readonly vectorSearch?: (
     input: RAGQueryInput,
   ) => Promise<RAGDocument[]>;
+  private readonly metrics?: Metrics;
 
   constructor(deps: RAGServiceDeps);
-  constructor(logger: Logger, deps: Pick<RAGServiceDeps, "adapter" | "vectorSearch">);
-  constructor(arg1?: Logger | RAGServiceDeps, arg2?: Pick<RAGServiceDeps, "adapter" | "vectorSearch">) {
+  constructor(
+    logger: Logger,
+    deps: Pick<RAGServiceDeps, "adapter" | "vectorSearch" | "metrics">,
+  );
+  constructor(
+    arg1?: Logger | RAGServiceDeps,
+    arg2?: Pick<RAGServiceDeps, "adapter" | "vectorSearch" | "metrics">,
+  ) {
     const legacy =
       arg2 !== undefined ||
       (arg1 !== undefined && isLoggerLike(arg1));
@@ -97,6 +107,7 @@ export class RAGService {
       deps.adapter != null
         ? (input) => deps.adapter!.query(input)
         : deps.vectorSearch;
+    this.metrics = deps.metrics;
   }
 
   async query(input: RAGQueryInput): Promise<RAGQueryResult> {
@@ -124,18 +135,44 @@ export class RAGService {
         "rag query start",
       );
 
-      const documents = await this.searchVectorStore(
-        input.tenantId.trim(),
-        normalizedQuery,
-        usedTopK,
-      );
+      const tenantLabel = { tenant_id: input.tenantId.trim() };
+      const m = this.metrics;
+      if (m) {
+        m.incrementCounter("rag_queries_total", 1, tenantLabel);
+      }
+
+      const ragStart = process.hrtime.bigint();
+      let documents: RAGDocument[] = [];
+      try {
+        documents = await this.searchVectorStore(
+          input.tenantId.trim(),
+          normalizedQuery,
+          usedTopK,
+        );
+      } catch (searchErr) {
+        if (m) {
+          m.incrementCounter("rag_retrieval_failed_total", 1, tenantLabel);
+        }
+        throw searchErr;
+      } finally {
+        if (m) {
+          const ragSecs = Number(process.hrtime.bigint() - ragStart) / 1e9;
+          m.observeHistogram("rag_latency_seconds", ragSecs, tenantLabel);
+        }
+      }
 
       if (documents.length === 0) {
+        if (m) {
+          m.incrementCounter("rag_no_documents_total", 1, tenantLabel);
+        }
         log.info(
           { step: "rag_query_empty", usedTopK },
           "rag query empty",
         );
       } else {
+        if (m) {
+          m.incrementCounter("rag_queries_with_documents_total", 1, tenantLabel);
+        }
         log.info(
           {
             step: "rag_query_ok",
