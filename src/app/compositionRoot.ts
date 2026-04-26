@@ -16,6 +16,8 @@ import { BasicDecisionMatrix } from "../core/validation/DecisionMatrixImpl";
 import { BasicHardGate } from "../core/validation/HardGateImpl";
 import { NoopValidationMetricsPort } from "../core/validation/NoopMetricsPort";
 import { ProductionAIValidator } from "../core/validation/ProductionAIValidator";
+import { LexicalGroundingClient } from "../infra/grounding/LexicalGroundingClient";
+import { LexicalGroundingPort } from "../infra/grounding/LexicalGroundingPort";
 import { OpenAIModerationClient } from "../infra/providers/openai/OpenAIModerationClient";
 import { OpenAIModerationSafetyPort } from "../infra/providers/openai/OpenAIModerationSafetyPort";
 import { YCloudClient } from "../infra/providers/ycloud/ycloudClient";
@@ -63,6 +65,30 @@ function readSafetyPortEnabled(defaultValue: boolean): boolean {
   if (raw === undefined || raw === "") return defaultValue;
   if (raw === "false" || raw === "0" || raw === "no") return false;
   return true;
+}
+
+/**
+ * Kill-switch operativo del GroundingPort (Lexical Grounding v1).
+ * Default: DESHABILITADO. Solo se activa con `GROUNDING_PORT_ENABLED=true|1|yes`.
+ *
+ * Cuando esta deshabilitado el `ProductionAIValidator` preserva la heuristica
+ * base `groundingReferences.length > 0` del `BasicAIValidator`. Cuando esta
+ * habilitado, el adapter calcula coverage de bigramas entre `aiOutputText` y
+ * `excerpt` de las referencias RAG.
+ */
+function readGroundingPortEnabled(defaultValue: boolean): boolean {
+  const raw = process.env.GROUNDING_PORT_ENABLED?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return defaultValue;
+  if (raw === "true" || raw === "1" || raw === "yes") return true;
+  return false;
+}
+
+function readMinConfidence(defaultValue: number): number {
+  const raw = process.env.GROUNDING_MIN_CONFIDENCE?.trim();
+  if (!raw) return defaultValue;
+  const n = Number.parseFloat(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 1) return defaultValue;
+  return n;
 }
 
 export type AppContext = {
@@ -169,6 +195,7 @@ export async function createAppContext(
   });
 
   const safetyPortEnabled = readSafetyPortEnabled(true);
+  const groundingPortEnabled = readGroundingPortEnabled(false);
   const openaiApiKey = process.env.OPENAI_API_KEY?.trim();
 
   let aiValidator: AIValidator;
@@ -191,17 +218,42 @@ export async function createAppContext(
       logger: log,
       metrics,
     });
+
+    const groundingPort = groundingPortEnabled
+      ? new LexicalGroundingPort({
+          client: new LexicalGroundingClient({
+            minOutputChars: readPositiveInt("GROUNDING_MIN_OUTPUT_CHARS", 20),
+          }),
+          minConfidence: readMinConfidence(0.3),
+          logger: log,
+          metrics,
+        })
+      : undefined;
+
     aiValidator = new ProductionAIValidator({
       safetyPort,
+      groundingPort,
       base: new BasicAIValidator(),
       logger: log,
       metrics,
       safetyTimeoutMs: readPositiveInt("SAFETY_VALIDATOR_TIMEOUT_MS", 5000),
+      groundingTimeoutMs: readPositiveInt("GROUNDING_VALIDATOR_TIMEOUT_MS", 5000),
     });
     log.info(
       { event: "safety_port_wired", provider: "openai_moderation" },
       "safety port enabled",
     );
+    if (groundingPort !== undefined) {
+      log.info(
+        { event: "grounding_port_wired", backend: "lexical_v1" },
+        "grounding port enabled (lexical v1)",
+      );
+    } else {
+      log.info(
+        { event: "grounding_port_disabled", reason: "kill_switch_default_off" },
+        "grounding port disabled (default off; preserving base heuristic)",
+      );
+    }
   } else {
     aiValidator = new BasicAIValidator();
     log.warn(
@@ -211,6 +263,15 @@ export async function createAppContext(
       },
       "safety port disabled; using BasicAIValidator (isSafe placeholder)",
     );
+    if (groundingPortEnabled) {
+      log.warn(
+        {
+          event: "grounding_port_skipped",
+          reason: "safety_port_off_basic_validator_in_use",
+        },
+        "grounding port not wired because BasicAIValidator is in use",
+      );
+    }
   }
 
   const aiDecisionMatrix = new BasicDecisionMatrix();

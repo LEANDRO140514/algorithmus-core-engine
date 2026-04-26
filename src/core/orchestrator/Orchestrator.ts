@@ -518,6 +518,10 @@ ${context.message}
           id: doc.id,
           source: "rag",
           score: doc.score,
+          excerpt: doc.content
+            .replace(/```[\s\S]*?```/g, "")
+            .trim()
+            .slice(0, RAG_DOCUMENT_MAX_CHARS),
         }));
         const piped = await this.runValidationPipeline({
           llmResponse,
