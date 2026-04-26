@@ -1,39 +1,19 @@
-export type FSMState =
-  | "INIT"
-  | "QUALIFYING"
-  | "SUPPORT_RAG"
-  | "BOOKING"
-  | "HUMAN_HANDOVER";
+import type {
+  ExtractedData,
+  FSMContext,
+  FSMResult,
+  FSMState,
+} from "./fsm.types";
 
-export type ExtractedData = {
-  intent?: "venta" | "soporte";
-  qualifyingComplete?: boolean;
-  lowRagConfidence?: boolean;
-  ragConfidence?: number;
-  ragAttempts?: number;
-  bookingAvailabilityMissing?: boolean;
-  bookingConfirmed?: boolean;
-};
-
-export type FSMContext = {
-  leadId: string;
-  tenantId: string;
-  currentState: FSMState;
-  message: string;
-  traceId?: string;
-  extractedData?: ExtractedData;
-};
-
-export type FSMResult = {
-  nextState: FSMState;
-  action:
-    | "classify_intent"
-    | "extract_slots"
-    | "query_rag"
-    | "book_appointment"
-    | "handover_human"
-    | "reply";
-};
+export type {
+  ExtractedData,
+  FSMAction,
+  FSMContext,
+  FSMResult,
+  FSMState,
+  FSMTransitionReasonCode,
+  FSMTransitionResult,
+} from "./fsm.types";
 
 const RAG_CONFIDENCE_LOW_THRESHOLD = 0.5;
 

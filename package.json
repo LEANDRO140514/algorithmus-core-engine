@@ -2,7 +2,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/app/server.js",
-    "worker:whatsapp": "node dist/workers/whatsappWorker.js"
+    "worker:whatsapp": "node dist/workers/whatsappWorker.js",
+    "test": "jest"
   },
   "dependencies": {
     "@pinecone-database/pinecone": "^7.1.0",
@@ -16,8 +17,11 @@
     "redis": "^5.11.0"
   },
   "devDependencies": {
+    "@jest/globals": "^30.3.0",
     "@types/express": "^4.17.25",
     "@types/node": "^25.5.2",
+    "jest": "^30.3.0",
+    "ts-jest": "^29.4.9",
     "typescript": "^6.0.2"
   }
 }

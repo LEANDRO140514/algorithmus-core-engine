@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 import type { Logger } from "pino";
 import { EmbeddingService } from "../core/embedding/EmbeddingService";
 import { FSMEngine } from "../core/fsm/FSMEngine";
+import { FSMTransitionChecker } from "../core/fsm/FSMTransitionChecker";
 import { IdentityManager } from "../core/identity/IdentityManager";
 import { LLMGateway } from "../core/llm/LLMGateway";
 import type { Metrics } from "../core/observability/Metrics";
@@ -9,6 +10,10 @@ import { NoopMetrics } from "../core/observability/Metrics";
 import { Orchestrator } from "../core/orchestrator/Orchestrator";
 import { PineconeRAGAdapter } from "../core/rag/PineconeRAGAdapter";
 import { RAGService } from "../core/rag/RAGService";
+import { BasicAIValidator } from "../core/validation/AIValidatorImpl";
+import { BasicDecisionMatrix } from "../core/validation/DecisionMatrixImpl";
+import { BasicHardGate } from "../core/validation/HardGateImpl";
+import { NoopValidationMetricsPort } from "../core/validation/NoopMetricsPort";
 import { YCloudClient } from "../infra/providers/ycloud/ycloudClient";
 import { YCloudInboundIdempotency } from "../infra/providers/ycloud/ycloudIdempotency";
 import { YCloudSender } from "../infra/providers/ycloud/ycloudSender";
@@ -141,6 +146,13 @@ export async function createAppContext(
     getRedis,
     logger: log,
   });
+
+  const aiValidator = new BasicAIValidator();
+  const aiDecisionMatrix = new BasicDecisionMatrix();
+  const aiHardGate = new BasicHardGate();
+  const fsmTransitionChecker = new FSMTransitionChecker(fsmEngine);
+  const validationMetrics = new NoopValidationMetricsPort();
+
   const orchestrator = new Orchestrator({
     logger: log,
     metrics,
@@ -148,6 +160,11 @@ export async function createAppContext(
     fsmEngine,
     llmGateway,
     ragService: rag,
+    validator: aiValidator,
+    decisionMatrix: aiDecisionMatrix,
+    hardGate: aiHardGate,
+    fsmTransitionChecker,
+    validationMetrics,
   });
 
   let inboundJobProducer: WhatsAppInboundJobProducer | undefined;

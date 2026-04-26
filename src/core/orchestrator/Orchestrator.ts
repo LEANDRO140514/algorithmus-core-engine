@@ -2,13 +2,35 @@ import pino, { type Logger } from "pino";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Metrics } from "../observability/Metrics";
 import { NoopMetrics } from "../observability/Metrics";
-import type { ExtractedData, FSMContext, FSMResult } from "../fsm/FSMEngine";
+import type {
+  ExtractedData,
+  FSMContext,
+  FSMResult,
+} from "../fsm/fsm.types";
 import { FSMEngine } from "../fsm/FSMEngine";
+import { FSMTransitionChecker } from "../fsm/FSMTransitionChecker";
 import type { LLMInput, LLMResponse } from "../llm/LLMGateway";
 import { LLMGateway } from "../llm/LLMGateway";
 import type { RAGQueryResult } from "../rag/RAGService";
 import { RAGService } from "../rag/RAGService";
 import { createSupabaseServerClient } from "../supabase_client";
+import type {
+  AIValidationTask,
+  AIValidator,
+  DecisionMatrix,
+  DecisionMatrixOutput,
+  GroundingReference,
+  HardGate,
+  HardGateOutput,
+  MetricsPort as ValidationMetricsPort,
+  ValidationContext,
+  ValidationMetricsEvent,
+  ValidationResult,
+} from "../validation/AIValidationLayer";
+import { BasicAIValidator } from "../validation/AIValidatorImpl";
+import { BasicDecisionMatrix } from "../validation/DecisionMatrixImpl";
+import { BasicHardGate } from "../validation/HardGateImpl";
+import { NoopValidationMetricsPort } from "../validation/NoopMetricsPort";
 
 const RAG_CONTEXT_MAX_CHARS = 2000;
 const RAG_DOCUMENT_MAX_CHARS = 500;
@@ -25,6 +47,9 @@ const RAG_TOP_K =
   parsedTopK <= 50
     ? parsedTopK
     : DEFAULT_RAG_TOP_K;
+
+const SAFE_FALLBACK_MESSAGE = "Hubo un problema, intenta nuevamente.";
+const DEFAULT_AI_MESSAGE = "Procesando tu solicitud...";
 
 const defaultLog = pino({
   level: process.env.LOG_LEVEL ?? "info",
@@ -54,6 +79,9 @@ export type OrchestratorInternalDiagnostics = Readonly<{
   persistError?: string;
   llmFailureReason?: string;
   ragFailure?: OrchestratorRagDiagnostic;
+  hardGateBlocked?: boolean;
+  hardGateReason?: HardGateOutput["reason"];
+  decisionAction?: DecisionMatrixOutput["action"];
 }>;
 
 export type OrchestratorProcessResult = {
@@ -62,7 +90,7 @@ export type OrchestratorProcessResult = {
   /** Tras inyectar datos del LLM, segunda evaluación; igual que `initial` si no hubo llamada LLM. */
   final: FSMResult;
   llmResponse?: LLMResponse;
-  /** Texto listo para enviar al usuario (siempre definido). */
+  /** Texto listo para enviar al usuario (siempre definido y autorizado por HardGate). */
   messageToSend: string;
   /**
    * `true`: persistencia OK **o** no fue necesaria escribir (estado sin cambio).
@@ -85,6 +113,12 @@ export type OrchestratorDeps = {
   fsmEngine: FSMEngine;
   llmGateway: LLMGateway;
   ragService: RAGService;
+  /** AI Validation Layer (skeleton). Si se omiten, se usan implementaciones Basic/Noop. */
+  validator?: AIValidator;
+  decisionMatrix?: DecisionMatrix;
+  hardGate?: HardGate;
+  fsmTransitionChecker?: FSMTransitionChecker;
+  validationMetrics?: ValidationMetricsPort;
 };
 
 type LegacyOrchestratorObjectDeps = {
@@ -123,6 +157,15 @@ function internalDiagnosticsNonEmpty(
   if (d.ragFailure !== undefined) {
     return true;
   }
+  if (d.hardGateBlocked === true) {
+    return true;
+  }
+  if (d.hardGateReason !== undefined) {
+    return true;
+  }
+  if (d.decisionAction !== undefined) {
+    return true;
+  }
   return false;
 }
 
@@ -145,7 +188,35 @@ function isLegacyOrchestratorObjectDeps(
 }
 
 /**
- * Orquesta FSM + LLM: la FSM define la acción; este módulo solo invoca al gateway y re-evalúa.
+ * Resultado del pipeline de validación IA tras una llamada LLM exitosa.
+ *
+ * Pipeline obligatorio:
+ *   FSM inicial (acción permitida)
+ *     -> AI
+ *     -> Validation
+ *     -> Decision
+ *     -> FSM transition check
+ *     -> HardGate
+ *     -> Output
+ */
+type ValidationPipelineOutcome = {
+  readonly final: FSMResult;
+  readonly messageToSend: string;
+  readonly validation: ValidationResult;
+  readonly decision: DecisionMatrixOutput;
+  readonly gate: HardGateOutput;
+  readonly diagnostics: OrchestratorInternalDiagnostics;
+};
+
+/**
+ * Orquesta FSM + LLM + AI Validation Layer.
+ *
+ * Garantías:
+ *   - Toda salida IA pasa por HardGate (no hay path alterno).
+ *   - El validator solo evalúa; la DecisionMatrix decide; el FSM autoriza la
+ *     transición; el HardGate bloquea la salida final.
+ *   - Si la salida no es autorizada se emite un mensaje de fallback seguro y
+ *     no se transiciona el estado FSM.
  */
 export class Orchestrator {
   private readonly fsm: FSMEngine;
@@ -154,6 +225,11 @@ export class Orchestrator {
   private readonly log: Logger;
   private readonly supabase: () => SupabaseClient;
   private readonly metrics: Metrics;
+  private readonly validator: AIValidator;
+  private readonly decisionMatrix: DecisionMatrix;
+  private readonly hardGate: HardGate;
+  private readonly transitionChecker: FSMTransitionChecker;
+  private readonly validationMetrics: ValidationMetricsPort;
 
   constructor(deps: OrchestratorDeps);
   constructor(
@@ -175,6 +251,13 @@ export class Orchestrator {
       this.log = arg1.logger ?? defaultLog;
       this.supabase = arg1.supabase;
       this.metrics = arg1.metrics ?? new NoopMetrics();
+      this.validator = arg1.validator ?? new BasicAIValidator();
+      this.decisionMatrix = arg1.decisionMatrix ?? new BasicDecisionMatrix();
+      this.hardGate = arg1.hardGate ?? new BasicHardGate();
+      this.transitionChecker =
+        arg1.fsmTransitionChecker ?? new FSMTransitionChecker(this.fsm);
+      this.validationMetrics =
+        arg1.validationMetrics ?? new NoopValidationMetricsPort();
     } else if (isLegacyOrchestratorObjectDeps(arg1)) {
       this.fsm = arg1.fsm;
       this.llm = arg1.llm;
@@ -182,6 +265,11 @@ export class Orchestrator {
       this.log = arg1.logger ?? defaultLog;
       this.supabase = createSupabaseServerClient;
       this.metrics = new NoopMetrics();
+      this.validator = new BasicAIValidator();
+      this.decisionMatrix = new BasicDecisionMatrix();
+      this.hardGate = new BasicHardGate();
+      this.transitionChecker = new FSMTransitionChecker(this.fsm);
+      this.validationMetrics = new NoopValidationMetricsPort();
       this.log.warn(
         {
           event: "deprecated_constructor_usage",
@@ -198,6 +286,11 @@ export class Orchestrator {
       this.log = arg4 ?? defaultLog;
       this.supabase = createSupabaseServerClient;
       this.metrics = new NoopMetrics();
+      this.validator = new BasicAIValidator();
+      this.decisionMatrix = new BasicDecisionMatrix();
+      this.hardGate = new BasicHardGate();
+      this.transitionChecker = new FSMTransitionChecker(this.fsm);
+      this.validationMetrics = new NoopValidationMetricsPort();
       this.log.warn(
         {
           event: "deprecated_constructor_usage",
@@ -237,7 +330,7 @@ export class Orchestrator {
           return this.finalizeWithPersist(context, final, log, {
             initial,
             final,
-            messageToSend: "Hubo un problema, intenta nuevamente.",
+            messageToSend: SAFE_FALLBACK_MESSAGE,
             internalDiagnostics: {
               llmFailureReason: gen.errorDetail,
             },
@@ -245,22 +338,25 @@ export class Orchestrator {
         }
         const { llmResponse } = gen;
         const extractedData = this.mergeClassify(context, llmResponse);
-        const final = this.fsm.evaluate({
-          ...context,
-          currentState: initial.nextState,
+        const piped = await this.runValidationPipeline({
+          llmResponse,
+          initial,
+          context,
           extractedData,
+          task: "classify_intent",
+          references: [],
+          log,
         });
         log.info(
-          { step: "fsm_final", nextState: final.nextState },
+          { step: "fsm_final", nextState: piped.final.nextState },
           "fsm final",
         );
-        const messageToSend =
-          llmResponse.text ?? "Procesando tu solicitud...";
-        return this.finalizeWithPersist(context, final, log, {
+        return this.finalizeWithPersist(context, piped.final, log, {
           initial,
-          final,
+          final: piped.final,
           llmResponse,
-          messageToSend,
+          messageToSend: piped.messageToSend,
+          internalDiagnostics: piped.diagnostics,
         });
       }
 
@@ -271,7 +367,7 @@ export class Orchestrator {
           return this.finalizeWithPersist(context, final, log, {
             initial,
             final,
-            messageToSend: "Hubo un problema, intenta nuevamente.",
+            messageToSend: SAFE_FALLBACK_MESSAGE,
             internalDiagnostics: {
               llmFailureReason: gen.errorDetail,
             },
@@ -279,22 +375,25 @@ export class Orchestrator {
         }
         const { llmResponse } = gen;
         const extractedData = this.mergeExtractSlots(context, llmResponse);
-        const final = this.fsm.evaluate({
-          ...context,
-          currentState: initial.nextState,
+        const piped = await this.runValidationPipeline({
+          llmResponse,
+          initial,
+          context,
           extractedData,
+          task: "extract_slots",
+          references: [],
+          log,
         });
         log.info(
-          { step: "fsm_final", nextState: final.nextState },
+          { step: "fsm_final", nextState: piped.final.nextState },
           "fsm final",
         );
-        const messageToSend =
-          llmResponse.text ?? "Procesando tu solicitud...";
-        return this.finalizeWithPersist(context, final, log, {
+        return this.finalizeWithPersist(context, piped.final, log, {
           initial,
-          final,
+          final: piped.final,
           llmResponse,
-          messageToSend,
+          messageToSend: piped.messageToSend,
+          internalDiagnostics: piped.diagnostics,
         });
       }
 
@@ -390,7 +489,7 @@ ${context.message}
           return this.finalizeWithPersist(context, final, log, {
             initial,
             final,
-            messageToSend: "Hubo un problema, intenta nuevamente.",
+            messageToSend: SAFE_FALLBACK_MESSAGE,
             internalDiagnostics: {
               llmFailureReason: gen.errorDetail,
             },
@@ -405,22 +504,30 @@ ${context.message}
           ...context.extractedData,
           ...newData,
         };
-        const final = this.fsm.evaluate({
-          ...context,
-          currentState: initial.nextState,
+        const references: GroundingReference[] = docsOrdered.map((doc) => ({
+          id: doc.id,
+          source: "rag",
+          score: doc.score,
+        }));
+        const piped = await this.runValidationPipeline({
+          llmResponse,
+          initial,
+          context,
           extractedData,
+          task: "rag_answer",
+          references,
+          log,
         });
         log.info(
-          { step: "fsm_final", nextState: final.nextState },
+          { step: "fsm_final", nextState: piped.final.nextState },
           "fsm final",
         );
-        const messageToSend =
-          llmResponse.text ?? "Procesando tu solicitud...";
-        return this.finalizeWithPersist(context, final, log, {
+        return this.finalizeWithPersist(context, piped.final, log, {
           initial,
-          final,
+          final: piped.final,
           llmResponse,
-          messageToSend,
+          messageToSend: piped.messageToSend,
+          internalDiagnostics: piped.diagnostics,
         });
       }
 
@@ -431,7 +538,7 @@ ${context.message}
           return this.finalizeWithPersist(context, final, log, {
             initial,
             final,
-            messageToSend: "Hubo un problema, intenta nuevamente.",
+            messageToSend: SAFE_FALLBACK_MESSAGE,
             internalDiagnostics: {
               llmFailureReason: gen.errorDetail,
             },
@@ -441,22 +548,25 @@ ${context.message}
         const extractedData = {
           ...context.extractedData,
         };
-        const final = this.fsm.evaluate({
-          ...context,
-          currentState: initial.nextState,
+        const piped = await this.runValidationPipeline({
+          llmResponse,
+          initial,
+          context,
           extractedData,
+          task: "generate_reply",
+          references: [],
+          log,
         });
         log.info(
-          { step: "fsm_final", nextState: final.nextState },
+          { step: "fsm_final", nextState: piped.final.nextState },
           "fsm final",
         );
-        const messageToSend =
-          llmResponse.text ?? "Procesando tu solicitud...";
-        return this.finalizeWithPersist(context, final, log, {
+        return this.finalizeWithPersist(context, piped.final, log, {
           initial,
-          final,
+          final: piped.final,
           llmResponse,
-          messageToSend,
+          messageToSend: piped.messageToSend,
+          internalDiagnostics: piped.diagnostics,
         });
       }
 
@@ -471,10 +581,126 @@ ${context.message}
         return this.finalizeWithPersist(context, final, log, {
           initial,
           final,
-          messageToSend: "Procesando tu solicitud...",
+          messageToSend: DEFAULT_AI_MESSAGE,
         });
       }
     }
+  }
+
+  /**
+   * Pipeline obligatorio post-AI:
+   *   Validation -> Decision -> FSM transition check -> HardGate.
+   *
+   * Solo cuando `gate.allowed && decision.action === "accept"` se emite el
+   * texto IA y se transiciona el estado FSM. En cualquier otro caso se devuelve
+   * un mensaje de fallback seguro y se mantiene el estado actual.
+   */
+  private async runValidationPipeline(args: {
+    llmResponse: LLMResponse;
+    initial: FSMResult;
+    context: FSMContext;
+    extractedData: ExtractedData;
+    task: AIValidationTask;
+    references: readonly GroundingReference[];
+    log: Logger;
+  }): Promise<ValidationPipelineOutcome> {
+    const { llmResponse, initial, context, extractedData, task, references, log } =
+      args;
+
+    const updatedContext: FSMContext = {
+      ...context,
+      currentState: initial.nextState,
+      extractedData,
+    };
+
+    const validationContext: ValidationContext = {
+      tenantId: context.tenantId,
+      leadId: context.leadId,
+      traceId: context.traceId,
+      task,
+      userMessage: context.message,
+      aiOutput: {
+        text: llmResponse.text,
+        confidence: llmResponse.confidence,
+      },
+      groundingReferences: references,
+      fsmContext: updatedContext,
+    };
+
+    const validation = await this.validator.validate(validationContext);
+
+    const decision = this.decisionMatrix.decide({
+      validation,
+      attemptNumber: 1,
+      maxRetries: 0,
+      fallbackAvailable: true,
+      handoverAvailable: false,
+    });
+
+    const fsmTransition = this.transitionChecker.check({
+      context: updatedContext,
+    });
+
+    const gate = this.hardGate.authorize({
+      validation,
+      decision,
+      fsmTransition,
+    });
+
+    const metricsEvent: ValidationMetricsEvent = {
+      tenantId: context.tenantId,
+      traceId: context.traceId,
+      task,
+      validation,
+      decision,
+      fsmTransition,
+      hardGate: gate,
+    };
+    this.validationMetrics.recordValidation(metricsEvent);
+    this.validationMetrics.recordDecision(metricsEvent);
+    this.validationMetrics.recordHardGate(metricsEvent);
+
+    log.info(
+      {
+        step: "ai_validation_pipeline",
+        task,
+        validation_flags: validation.flags,
+        validation_confidence: validation.scores.confidence,
+        decision_action: decision.action,
+        fsm_transition_allowed: fsmTransition.allowed,
+        hard_gate_allowed: gate.allowed,
+        hard_gate_reason: gate.reason,
+      },
+      "ai validation pipeline",
+    );
+
+    let messageToSend: string;
+    let final: FSMResult;
+    if (gate.allowed && decision.action === "accept") {
+      messageToSend = llmResponse.text;
+      final = {
+        nextState: fsmTransition.toState,
+        action: fsmTransition.action ?? initial.action,
+      };
+    } else {
+      messageToSend = SAFE_FALLBACK_MESSAGE;
+      final = initial;
+    }
+
+    const diagnostics: OrchestratorInternalDiagnostics = {
+      hardGateBlocked: !gate.allowed,
+      hardGateReason: gate.reason,
+      decisionAction: decision.action,
+    };
+
+    return {
+      final,
+      messageToSend,
+      validation,
+      decision,
+      gate,
+      diagnostics,
+    };
   }
 
   private async finalizeWithPersist(
