@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, jest } from "@jest/globals";
 import type { FSMContext, FSMTransitionResult } from "../../core/fsm/fsm.types";
-import { FSMEngine } from "../../core/fsm/FSMEngine";
+import {
+  FSMEngine,
+  getAllowedActionsForState,
+} from "../../core/fsm/FSMEngine";
 import { FSMTransitionChecker } from "../../core/fsm/FSMTransitionChecker";
 import type { LLMResponse } from "../../core/llm/LLMGateway";
 import { LLMGateway } from "../../core/llm/LLMGateway";
@@ -8,8 +11,11 @@ import type { RAGDocument } from "../../core/rag/RAGService";
 import { RAGService } from "../../core/rag/RAGService";
 import { Orchestrator } from "../../core/orchestrator/Orchestrator";
 import type {
+  AIValidationTask,
   AIValidator,
   DecisionMatrix,
+  ValidationContext,
+  ValidationResult,
 } from "../../core/validation/AIValidationLayer";
 import { BasicAIValidator } from "../../core/validation/AIValidatorImpl";
 import { BasicDecisionMatrix } from "../../core/validation/DecisionMatrixImpl";
@@ -402,5 +408,123 @@ describe("AI Validation Layer — destructive system tests", () => {
       expect(result.messageToSend).toBe(SAFE_FALLBACK_MESSAGE);
       expect(result.internalDiagnostics?.hardGateBlocked).toBe(true);
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Scenario 8 — unit-level: BasicAIValidator deriva isWithinFSM de
+  // (allowedActions, expectedAction) sin tocar FSMEngine.
+  // ---------------------------------------------------------------------------
+  it("scenario 8: BasicAIValidator → isWithinFSM is true iff expectedAction ∈ allowedActions", async () => {
+    const validator = new BasicAIValidator();
+
+    const baseContext: Omit<ValidationContext, "expectedAction" | "fsmContext"> = {
+      tenantId: "tenant-test",
+      leadId: "lead-test",
+      traceId: "trace-test",
+      task: "rag_answer",
+      userMessage: "hola",
+      aiOutput: { text: "respuesta", confidence: 0.9 },
+      groundingReferences: [{ id: "doc-1", source: "rag" }],
+    };
+
+    // (a) expectedAction ∈ allowedActions(SUPPORT_RAG) → isWithinFSM=true
+    const ok = await validator.validate({
+      ...baseContext,
+      expectedAction: "rag_answer",
+      fsmContext: {
+        leadId: "lead-test",
+        tenantId: "tenant-test",
+        currentState: "SUPPORT_RAG",
+        message: "hola",
+        allowedActions: getAllowedActionsForState("SUPPORT_RAG"),
+      },
+    });
+    expect(ok.flags.isWithinFSM).toBe(true);
+    expect(ok.reasonCodes).not.toContain("outside_fsm");
+
+    // (b) expectedAction ∉ allowedActions(BOOKING) → isWithinFSM=false
+    const drift = await validator.validate({
+      ...baseContext,
+      expectedAction: "rag_answer",
+      fsmContext: {
+        leadId: "lead-test",
+        tenantId: "tenant-test",
+        currentState: "BOOKING",
+        message: "hola",
+        allowedActions: getAllowedActionsForState("BOOKING"),
+      },
+    });
+    expect(drift.flags.isWithinFSM).toBe(false);
+    expect(drift.reasonCodes).toContain("outside_fsm");
+
+    // (c) allowedActions ausente → conjunto vacío → isWithinFSM=false
+    const missing = await validator.validate({
+      ...baseContext,
+      expectedAction: "rag_answer",
+      fsmContext: {
+        leadId: "lead-test",
+        tenantId: "tenant-test",
+        currentState: "SUPPORT_RAG",
+        message: "hola",
+      },
+    });
+    expect(missing.flags.isWithinFSM).toBe(false);
+    expect(missing.reasonCodes).toContain("outside_fsm");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Scenario 9 — end-to-end: ataque "intent drift". La IA propone una acción
+  // que el FSM NO permite en el estado actual. Pipeline completo (validator real
+  // + DecisionMatrix real + HardGate real) debe terminar en SAFE_FALLBACK_MESSAGE.
+  //
+  // Setup: estado QUALIFYING (allowedActions = [extract_slots, generate_reply]).
+  // El orquestador ejecuta extract_slots, pero un wrapper malicioso reescribe
+  // expectedAction → "rag_answer" antes de que el validator evalúe. El validator
+  // detecta la divergencia → isWithinFSM=false → DecisionMatrix=handover →
+  // HardGate=blocked_outside_fsm → fallback.
+  // ---------------------------------------------------------------------------
+  it("scenario 9: intent drift (expectedAction ∉ allowedActions) → handover → SAFE_FALLBACK_MESSAGE", async () => {
+    class ExpectedActionOverrideValidator implements AIValidator {
+      constructor(
+        private readonly inner: AIValidator,
+        private readonly forced: AIValidationTask,
+      ) {}
+      async validate(ctx: ValidationContext): Promise<ValidationResult> {
+        return this.inner.validate({ ...ctx, expectedAction: this.forced });
+      }
+    }
+
+    const aiPayload = "DRIFTED_PAYLOAD_THAT_MUST_NOT_LEAK";
+
+    const driftValidator = new ExpectedActionOverrideValidator(
+      new BasicAIValidator(),
+      "rag_answer",
+    );
+
+    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+      llmResponse: {
+        text: aiPayload,
+        provider: "ollama",
+        latency_ms: 1,
+        confidence: 0.99,
+      },
+      validator: driftValidator,
+    });
+
+    const result = await orchestrator.process(
+      buildFSMContext({
+        currentState: "QUALIFYING",
+        extractedData: {},
+      }),
+    );
+
+    expect(result.messageToSend).not.toBe(aiPayload);
+    expect(result.messageToSend).toBe(SAFE_FALLBACK_MESSAGE);
+    expect(result.internalDiagnostics?.decisionAction).toBe("handover");
+    expect(result.internalDiagnostics?.hardGateBlocked).toBe(true);
+    expect(result.internalDiagnostics?.hardGateReason).toBe(
+      "blocked_outside_fsm",
+    );
+    expect(supabaseUpdateCalls()).toBe(0);
   });
 });

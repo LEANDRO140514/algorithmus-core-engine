@@ -7,6 +7,7 @@ import type {
   FSMContext,
   FSMResult,
 } from "../fsm/fsm.types";
+import { getAllowedActionsForState } from "../fsm/fsm.types";
 import { FSMEngine } from "../fsm/FSMEngine";
 import { FSMTransitionChecker } from "../fsm/FSMTransitionChecker";
 import type { LLMInput, LLMResponse } from "../llm/LLMGateway";
@@ -206,6 +207,13 @@ type ValidationPipelineOutcome = {
   readonly decision: DecisionMatrixOutput;
   readonly gate: HardGateOutput;
   readonly diagnostics: OrchestratorInternalDiagnostics;
+  /**
+   * Invariante de seguridad: la persistencia FSM solo está autorizada cuando
+   * el HardGate permite la salida y la DecisionMatrix decide aceptarla.
+   * En cualquier otro caso (gate bloqueado, retry, fallback, handover) se
+   * preserva el estado actual y NO se ejecuta `UPDATE` en DB.
+   */
+  readonly shouldPersist: boolean;
 };
 
 /**
@@ -357,6 +365,7 @@ export class Orchestrator {
           llmResponse,
           messageToSend: piped.messageToSend,
           internalDiagnostics: piped.diagnostics,
+          shouldPersist: piped.shouldPersist,
         });
       }
 
@@ -394,6 +403,7 @@ export class Orchestrator {
           llmResponse,
           messageToSend: piped.messageToSend,
           internalDiagnostics: piped.diagnostics,
+          shouldPersist: piped.shouldPersist,
         });
       }
 
@@ -528,6 +538,7 @@ ${context.message}
           llmResponse,
           messageToSend: piped.messageToSend,
           internalDiagnostics: piped.diagnostics,
+          shouldPersist: piped.shouldPersist,
         });
       }
 
@@ -567,6 +578,7 @@ ${context.message}
           llmResponse,
           messageToSend: piped.messageToSend,
           internalDiagnostics: piped.diagnostics,
+          shouldPersist: piped.shouldPersist,
         });
       }
 
@@ -613,18 +625,30 @@ ${context.message}
       extractedData,
     };
 
+    /**
+     * El validator audita "la accion IA es valida en el estado donde el FSM
+     * la autorizo" -> usar `context.currentState` ORIGINAL, no `nextState`.
+     * `allowedActions` se deriva con la funcion pura, sin tocar FSMEngine.
+     */
+    const validationFsmContext: FSMContext = {
+      ...context,
+      extractedData,
+      allowedActions: getAllowedActionsForState(context.currentState),
+    };
+
     const validationContext: ValidationContext = {
       tenantId: context.tenantId,
       leadId: context.leadId,
       traceId: context.traceId,
       task,
+      expectedAction: task,
       userMessage: context.message,
       aiOutput: {
         text: llmResponse.text,
         confidence: llmResponse.confidence,
       },
       groundingReferences: references,
-      fsmContext: updatedContext,
+      fsmContext: validationFsmContext,
     };
 
     const validation = await this.validator.validate(validationContext);
@@ -674,9 +698,11 @@ ${context.message}
       "ai validation pipeline",
     );
 
+    const shouldPersist = gate.allowed && decision.action === "accept";
+
     let messageToSend: string;
     let final: FSMResult;
-    if (gate.allowed && decision.action === "accept") {
+    if (shouldPersist) {
       messageToSend = llmResponse.text;
       final = {
         nextState: fsmTransition.toState,
@@ -700,6 +726,7 @@ ${context.message}
       decision,
       gate,
       diagnostics,
+      shouldPersist,
     };
   }
 
@@ -713,6 +740,14 @@ ${context.message}
       messageToSend: string;
       llmResponse?: LLMResponse;
       internalDiagnostics?: OrchestratorInternalDiagnostics;
+      /**
+       * Si es `false`, la persistencia FSM se omite (no se ejecuta `UPDATE`).
+       * Usado por el pipeline de validación para garantizar la invariante
+       * "HardGate bloqueado → cero side effects". Default `true` preserva el
+       * comportamiento de rutas que no pasan por validación (LLM/RAG error,
+       * acciones FSM deterministas).
+       */
+      shouldPersist?: boolean;
     },
   ): Promise<OrchestratorProcessResult> {
     this.metrics.incrementCounter("fsm_transitions_total", 1, {
@@ -720,7 +755,10 @@ ${context.message}
       to_state: final.nextState,
     });
 
-    const persist = await this.persistFsmState(context, final, log);
+    const shouldPersist = partial.shouldPersist !== false;
+    const persist: FsmPersistResult = shouldPersist
+      ? await this.persistFsmState(context, final, log)
+      : { ok: true, outcome: "skipped_unchanged" };
 
     if (!persist.ok) {
       this.metrics.incrementCounter("fsm_persistence_failures_total");

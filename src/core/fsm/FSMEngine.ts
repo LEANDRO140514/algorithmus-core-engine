@@ -15,6 +15,8 @@ export type {
   FSMTransitionResult,
 } from "./fsm.types";
 
+export { getAllowedActionsForState } from "./fsm.types";
+
 const RAG_CONFIDENCE_LOW_THRESHOLD = 0.5;
 
 /** Intención ya clasificada (solo valores aceptados en runtime). */

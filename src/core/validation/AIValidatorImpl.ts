@@ -10,14 +10,18 @@ import type {
 const DEFAULT_CONFIDENCE = 0.5;
 
 /**
- * Validador esqueleto: SOLO evalúa, NO decide.
+ * Validador esqueleto: SOLO evalua, NO decide.
  *
- * Reglas mínimas:
- *   - isSafe       = true (placeholder; SafetyPort real aún no instalado)
- *   - isComplete   = texto presente y no vacío tras trim
+ * Reglas minimas:
+ *   - isSafe       = true (placeholder; SafetyPort real aun no instalado)
+ *   - isComplete   = texto presente y no vacio tras trim
  *   - isGrounded   = referencias presentes (length > 0)
- *   - isWithinFSM  = true (placeholder; ver TODO abajo)
+ *   - isWithinFSM  = `fsmContext.allowedActions` contiene `expectedAction`.
+ *                   `allowedActions` ausente -> conjunto vacio -> false.
  *   - confidence   = aiOutput.confidence ?? 0.5
+ *
+ * No depende de `FSMEngine`. Solo consume datos puros del `ValidationContext`
+ * (estado actual + acciones permitidas + accion esperada por el orquestador).
  */
 export class BasicAIValidator implements AIValidator {
   async validate(context: ValidationContext): Promise<ValidationResult> {
@@ -29,13 +33,17 @@ export class BasicAIValidator implements AIValidator {
     const isGrounded =
       Array.isArray(context.groundingReferences) &&
       context.groundingReferences.length > 0;
-    const isWithinFSM = true; // TODO: derive from FSM state + allowed actions
+    const allowedActions = context.fsmContext.allowedActions ?? [];
+    const isWithinFSM = allowedActions.includes(context.expectedAction);
 
     if (!isComplete) {
       reasonCodes.push("incomplete_output");
     }
     if (!isGrounded) {
       reasonCodes.push("ungrounded_output");
+    }
+    if (!isWithinFSM) {
+      reasonCodes.push("outside_fsm");
     }
 
     const flags: ValidationFlags = {

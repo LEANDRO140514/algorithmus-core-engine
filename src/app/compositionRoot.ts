@@ -10,10 +10,14 @@ import { NoopMetrics } from "../core/observability/Metrics";
 import { Orchestrator } from "../core/orchestrator/Orchestrator";
 import { PineconeRAGAdapter } from "../core/rag/PineconeRAGAdapter";
 import { RAGService } from "../core/rag/RAGService";
+import type { AIValidator } from "../core/validation/AIValidationLayer";
 import { BasicAIValidator } from "../core/validation/AIValidatorImpl";
 import { BasicDecisionMatrix } from "../core/validation/DecisionMatrixImpl";
 import { BasicHardGate } from "../core/validation/HardGateImpl";
 import { NoopValidationMetricsPort } from "../core/validation/NoopMetricsPort";
+import { ProductionAIValidator } from "../core/validation/ProductionAIValidator";
+import { OpenAIModerationClient } from "../infra/providers/openai/OpenAIModerationClient";
+import { OpenAIModerationSafetyPort } from "../infra/providers/openai/OpenAIModerationSafetyPort";
 import { YCloudClient } from "../infra/providers/ycloud/ycloudClient";
 import { YCloudInboundIdempotency } from "../infra/providers/ycloud/ycloudIdempotency";
 import { YCloudSender } from "../infra/providers/ycloud/ycloudSender";
@@ -42,6 +46,23 @@ function readQueueDepthIntervalMs(defaultMs: number): number {
     return defaultMs;
   }
   return n;
+}
+
+/**
+ * Kill-switch operativo del SafetyPort. Default: habilitado.
+ *
+ * Cualquier valor distinto de `"false"` (case-insensitive) cuenta como `true`.
+ * SAFETY_PORT_ENABLED=false NO desactiva el AI Validation Layer: el pipeline
+ * Validation -> Decision -> FSM -> HardGate -> Output sigue activo. Solo
+ * sustituye `ProductionAIValidator` por `BasicAIValidator` (que mantiene
+ * `isSafe=true` placeholder pero sigue evaluando isComplete/isGrounded/
+ * isWithinFSM/confidence).
+ */
+function readSafetyPortEnabled(defaultValue: boolean): boolean {
+  const raw = process.env.SAFETY_PORT_ENABLED?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return defaultValue;
+  if (raw === "false" || raw === "0" || raw === "no") return false;
+  return true;
 }
 
 export type AppContext = {
@@ -147,7 +168,51 @@ export async function createAppContext(
     logger: log,
   });
 
-  const aiValidator = new BasicAIValidator();
+  const safetyPortEnabled = readSafetyPortEnabled(true);
+  const openaiApiKey = process.env.OPENAI_API_KEY?.trim();
+
+  let aiValidator: AIValidator;
+  if (safetyPortEnabled && openaiApiKey) {
+    const moderationClient = new OpenAIModerationClient({
+      apiKey: openaiApiKey,
+      baseUrl: readEnvOptional(
+        "OPENAI_MODERATION_BASE_URL",
+        "https://api.openai.com/v1",
+      ),
+      model: readEnvOptional(
+        "OPENAI_MODERATION_MODEL",
+        "omni-moderation-latest",
+      ),
+      timeoutMs: readPositiveInt("OPENAI_MODERATION_TIMEOUT_MS", 3000),
+      logger: log,
+    });
+    const safetyPort = new OpenAIModerationSafetyPort({
+      client: moderationClient,
+      logger: log,
+      metrics,
+    });
+    aiValidator = new ProductionAIValidator({
+      safetyPort,
+      base: new BasicAIValidator(),
+      logger: log,
+      metrics,
+      safetyTimeoutMs: readPositiveInt("SAFETY_VALIDATOR_TIMEOUT_MS", 5000),
+    });
+    log.info(
+      { event: "safety_port_wired", provider: "openai_moderation" },
+      "safety port enabled",
+    );
+  } else {
+    aiValidator = new BasicAIValidator();
+    log.warn(
+      {
+        event: "safety_port_disabled",
+        reason: !safetyPortEnabled ? "kill_switch" : "missing_openai_api_key",
+      },
+      "safety port disabled; using BasicAIValidator (isSafe placeholder)",
+    );
+  }
+
   const aiDecisionMatrix = new BasicDecisionMatrix();
   const aiHardGate = new BasicHardGate();
   const fsmTransitionChecker = new FSMTransitionChecker(fsmEngine);

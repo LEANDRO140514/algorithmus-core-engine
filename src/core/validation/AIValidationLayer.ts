@@ -55,6 +55,16 @@ export interface ValidationContext {
   readonly leadId: string;
   readonly traceId?: string;
   readonly task: AIValidationTask;
+  /**
+   * Accion/intencion que el orquestador propone para esta llamada IA.
+   *
+   * El validator debe evaluar `isWithinFSM` como
+   * `fsmContext.allowedActions.includes(expectedAction)`. Coincide con
+   * `task` salvo extensiones futuras donde una sola tarea pueda mapear a
+   * acciones FSM distintas. NO se acopla a `FSMEngine`; es un dato del
+   * orquestador para el validator.
+   */
+  readonly expectedAction: AIValidationTask;
   readonly userMessage: string;
   readonly aiOutput: {
     readonly text?: string;
