@@ -7,6 +7,8 @@ import { LLMGateway } from "../../core/llm/LLMGateway";
 import type { RAGDocument } from "../../core/rag/RAGService";
 import { RAGService } from "../../core/rag/RAGService";
 import { Orchestrator } from "../../core/orchestrator/Orchestrator";
+import type { LeadRecord } from "../../infra/postgres/LeadsRepository";
+import { LeadsRepository } from "../../infra/postgres/LeadsRepository";
 import type {
   AIValidator,
   GroundingPort,
@@ -34,7 +36,7 @@ import { LexicalGroundingPort } from "../../infra/grounding/LexicalGroundingPort
  *     GroundingPort variable (real lexical o stub destructivo).
  *   - Invariante critica: si el output es ungrounded o el GroundingPort falla,
  *     el HardGate/DecisionMatrix bloquea la transicion FSM y NO debe haber
- *     UPDATE en Supabase.
+ *     UPDATE en `leads` via LeadsRepository.
  *
  * Mensaje de fallback hardcodeado en `Orchestrator.ts`. Si el literal cambia
  * en produccion sin actualizar este test, los tests deben fallar.
@@ -53,26 +55,39 @@ function buildFSMContext(overrides: Partial<FSMContext> = {}): FSMContext {
   };
 }
 
-function makeSupabaseStub(): {
-  client: () => unknown;
+function stubLeadRecord(overrides: Partial<LeadRecord> = {}): LeadRecord {
+  const now = new Date().toISOString();
+  return {
+    id: "lead-test",
+    tenant_id: "tenant-test",
+    phone_number: "+10000000000",
+    first_name: null,
+    email: null,
+    tags: {},
+    fsm_state: "SUPPORT_RAG",
+    ai_confidence_score: 0,
+    last_interaction: null,
+    created_at: now,
+    updated_at: now,
+    ...overrides,
+  };
+}
+
+function makeLeadsRepositoryStub(): {
+  repo: LeadsRepository;
   updateCalls: () => number;
 } {
   let updateCount = 0;
-  const chain: Record<string, unknown> = {};
-  const thenable = {
-    then: (onFulfilled: (value: { error: null }) => unknown) =>
-      Promise.resolve({ error: null }).then(onFulfilled),
-  };
-  chain.from = () => chain;
-  chain.update = () => {
-    updateCount += 1;
-    return chain;
-  };
-  chain.eq = () => Object.assign(chain, thenable);
-  return {
-    client: () => chain,
-    updateCalls: () => updateCount,
-  };
+  const repo = {
+    findByPhone: async () => null,
+    upsertLead: async () => stubLeadRecord(),
+    updateFsmState: async () => {
+      updateCount += 1;
+      return stubLeadRecord();
+    },
+    insertFromGhl: async () => stubLeadRecord(),
+  } as unknown as LeadsRepository;
+  return { repo, updateCalls: () => updateCount };
 }
 
 const SAFE_OUTPUT: SafetyPortOutput = {
@@ -106,7 +121,7 @@ type BuildOpts = {
 
 function buildOrchestrator(opts: BuildOpts): {
   orchestrator: Orchestrator;
-  supabaseUpdateCalls: () => number;
+  repositoryUpdateCalls: () => number;
 } {
   const fsmEngine = new FSMEngine();
   const llm = new LLMGateway();
@@ -118,10 +133,10 @@ function buildOrchestrator(opts: BuildOpts): {
     usedTopK: opts.ragDocuments.length || 5,
   });
 
-  const supabaseStub = makeSupabaseStub();
+  const leadsStub = makeLeadsRepositoryStub();
 
   const orchestrator = new Orchestrator({
-    supabase: supabaseStub.client as () => never,
+    leadsRepository: leadsStub.repo,
     fsmEngine,
     llmGateway: llm,
     ragService: rag,
@@ -134,7 +149,7 @@ function buildOrchestrator(opts: BuildOpts): {
 
   return {
     orchestrator,
-    supabaseUpdateCalls: supabaseStub.updateCalls,
+    repositoryUpdateCalls: leadsStub.updateCalls,
   };
 }
 
@@ -158,7 +173,7 @@ describe("GroundingPort (Lexical v1) — destructive system tests", () => {
       }),
     });
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: groundedAiText,
         provider: "ollama",
@@ -183,7 +198,7 @@ describe("GroundingPort (Lexical v1) — destructive system tests", () => {
     expect(result.messageToSend).toBe(groundedAiText);
     expect(result.internalDiagnostics?.decisionAction).toBe("accept");
     expect(result.internalDiagnostics?.hardGateBlocked).toBeFalsy();
-    expect(supabaseUpdateCalls()).toBe(1); // INIT -> SUPPORT_RAG
+    expect(repositoryUpdateCalls()).toBe(1); // INIT -> SUPPORT_RAG
   });
 
   // ---------------------------------------------------------------------------
@@ -201,7 +216,7 @@ describe("GroundingPort (Lexical v1) — destructive system tests", () => {
       }),
     });
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: ungroundedAiText,
         provider: "ollama",
@@ -226,7 +241,7 @@ describe("GroundingPort (Lexical v1) — destructive system tests", () => {
     expect(result.messageToSend).not.toBe(ungroundedAiText);
     expect(result.messageToSend).toBe(SAFE_FALLBACK_MESSAGE);
     expect(result.internalDiagnostics?.decisionAction).toBe("fallback");
-    expect(supabaseUpdateCalls()).toBe(0);
+    expect(repositoryUpdateCalls()).toBe(0);
   });
 
   // ---------------------------------------------------------------------------
@@ -243,7 +258,7 @@ describe("GroundingPort (Lexical v1) — destructive system tests", () => {
       }),
     });
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: aiPayload,
         provider: "ollama",
@@ -268,7 +283,7 @@ describe("GroundingPort (Lexical v1) — destructive system tests", () => {
     expect(result.messageToSend).not.toBe(aiPayload);
     expect(result.messageToSend).toBe(SAFE_FALLBACK_MESSAGE);
     expect(result.internalDiagnostics?.decisionAction).toBe("fallback");
-    expect(supabaseUpdateCalls()).toBe(0);
+    expect(repositoryUpdateCalls()).toBe(0);
   });
 
   // ---------------------------------------------------------------------------
@@ -286,7 +301,7 @@ describe("GroundingPort (Lexical v1) — destructive system tests", () => {
       groundingTimeoutMs: 50,
     });
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: aiPayload,
         provider: "ollama",
@@ -311,6 +326,6 @@ describe("GroundingPort (Lexical v1) — destructive system tests", () => {
     expect(result.messageToSend).not.toBe(aiPayload);
     expect(result.messageToSend).toBe(SAFE_FALLBACK_MESSAGE);
     expect(result.internalDiagnostics?.decisionAction).toBe("fallback");
-    expect(supabaseUpdateCalls()).toBe(0);
+    expect(repositoryUpdateCalls()).toBe(0);
   });
 });

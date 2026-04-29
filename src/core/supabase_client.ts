@@ -1,6 +1,12 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 /**
+ * LEGACY: Supabase is only used for GHL webhook integration.
+ * It is NOT part of the Core Engine runtime.
+ * Core Engine uses PostgreSQL via LeadsRepository.
+ */
+
+/**
  * Prima Donna — Supabase
  *
  * Variables (defínelas en Easypanel como entorno de **runtime** del contenedor,

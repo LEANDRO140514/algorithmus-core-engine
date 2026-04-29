@@ -1,5 +1,4 @@
 import pino, { type Logger } from "pino";
-import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Metrics } from "../observability/Metrics";
 import { NoopMetrics } from "../observability/Metrics";
 import type {
@@ -14,7 +13,7 @@ import type { LLMInput, LLMResponse } from "../llm/LLMGateway";
 import { LLMGateway } from "../llm/LLMGateway";
 import type { RAGQueryResult } from "../rag/RAGService";
 import { RAGService } from "../rag/RAGService";
-import { createSupabaseServerClient } from "../supabase_client";
+import { LeadsRepository } from "../../infra/postgres/LeadsRepository";
 import type {
   AIValidationTask,
   AIValidator,
@@ -110,7 +109,7 @@ export type OrchestratorProcessResult = {
 export type OrchestratorDeps = {
   logger?: Logger;
   metrics?: Metrics;
-  supabase: () => SupabaseClient;
+  leadsRepository: LeadsRepository;
   fsmEngine: FSMEngine;
   llmGateway: LLMGateway;
   ragService: RAGService;
@@ -138,8 +137,9 @@ function isCanonicalOrchestratorDeps(x: unknown): x is OrchestratorDeps {
     "fsmEngine" in o &&
     "llmGateway" in o &&
     "ragService" in o &&
-    "supabase" in o &&
-    typeof o.supabase === "function" &&
+    "leadsRepository" in o &&
+    o.leadsRepository != null &&
+    typeof o.leadsRepository === "object" &&
     o.fsmEngine != null &&
     o.llmGateway != null &&
     o.ragService != null
@@ -231,7 +231,7 @@ export class Orchestrator {
   private readonly llm: LLMGateway;
   private readonly rag: RAGService;
   private readonly log: Logger;
-  private readonly supabase: () => SupabaseClient;
+  private readonly leadsRepository: LeadsRepository;
   private readonly metrics: Metrics;
   private readonly validator: AIValidator;
   private readonly decisionMatrix: DecisionMatrix;
@@ -257,7 +257,7 @@ export class Orchestrator {
       this.llm = arg1.llmGateway;
       this.rag = arg1.ragService;
       this.log = arg1.logger ?? defaultLog;
-      this.supabase = arg1.supabase;
+      this.leadsRepository = arg1.leadsRepository;
       this.metrics = arg1.metrics ?? new NoopMetrics();
       this.validator = arg1.validator ?? new BasicAIValidator();
       this.decisionMatrix = arg1.decisionMatrix ?? new BasicDecisionMatrix();
@@ -271,7 +271,7 @@ export class Orchestrator {
       this.llm = arg1.llm;
       this.rag = arg1.rag;
       this.log = arg1.logger ?? defaultLog;
-      this.supabase = createSupabaseServerClient;
+      this.leadsRepository = new LeadsRepository();
       this.metrics = new NoopMetrics();
       this.validator = new BasicAIValidator();
       this.decisionMatrix = new BasicDecisionMatrix();
@@ -285,14 +285,14 @@ export class Orchestrator {
           mode: "legacy",
           variant: "object_fsm_llm_rag",
         },
-        "usar OrchestratorDeps con supabase, fsmEngine, llmGateway, ragService",
+        "usar OrchestratorDeps con leadsRepository, fsmEngine, llmGateway, ragService",
       );
     } else {
       this.fsm = arg1 as FSMEngine;
       this.llm = arg2 as LLMGateway;
       this.rag = arg3 as RAGService;
       this.log = arg4 ?? defaultLog;
-      this.supabase = createSupabaseServerClient;
+      this.leadsRepository = new LeadsRepository();
       this.metrics = new NoopMetrics();
       this.validator = new BasicAIValidator();
       this.decisionMatrix = new BasicDecisionMatrix();
@@ -306,7 +306,7 @@ export class Orchestrator {
           mode: "legacy",
           variant: "positional",
         },
-        "usar OrchestratorDeps con supabase, fsmEngine, llmGateway, ragService",
+        "usar OrchestratorDeps con leadsRepository, fsmEngine, llmGateway, ragService",
       );
     }
   }
@@ -821,19 +821,12 @@ ${context.message}
         "fsm persist attempt",
       );
 
-      const supabase = this.supabase();
-      const { error } = await supabase
-        .from("leads")
-        .update({
-          fsm_state: final.nextState,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", context.leadId)
-        .eq("tenant_id", context.tenantId);
-
-      if (error) {
-        throw error;
-      }
+      await this.leadsRepository.updateFsmState({
+        leadId: context.leadId,
+        tenantId: context.tenantId,
+        fsmState: final.nextState,
+        updatedAt: new Date().toISOString(),
+      });
 
       log.info(
         {

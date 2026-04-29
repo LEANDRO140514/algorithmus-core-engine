@@ -14,7 +14,6 @@
   "include": ["src/**/*"],
   "exclude": [
     "src/app/api/**",
-    "src/infra/postgres/**",
     "src/tests/**"
   ]
 }

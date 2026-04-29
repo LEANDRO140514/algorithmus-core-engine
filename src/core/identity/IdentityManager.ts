@@ -1,9 +1,6 @@
 import pino, { type Logger } from "pino";
-import type { SupabaseClient } from "@supabase/supabase-js";
-import { createSupabaseServerClient } from "../supabase_client";
 import { getRedis } from "../../infra/redis/client";
-import type { GHLIntegration } from "./GHLIntegration";
-import { GHLIntegrationStub } from "./GHLIntegration";
+import { LeadsRepository } from "../../infra/postgres/LeadsRepository";
 
 /** Fila `leads` alineada con `src/infra/postgres/schema.sql` y PRD §3.2. */
 export type CoreLead = {
@@ -41,26 +38,6 @@ else
 end
 `;
 
-function normalizePhoneE164(phone: string): string {
-  const cleaned = phone.replace(/[^\d+]/g, "");
-
-  if (!cleaned.startsWith("+")) {
-    throw new Error("phone must be in E.164 format");
-  }
-
-  const digits = cleaned.slice(1);
-
-  if (!/^\d+$/.test(digits)) {
-    throw new Error("phone contains invalid characters");
-  }
-
-  if (digits.length < 8) {
-    throw new Error("phone too short");
-  }
-
-  return `+${digits}`;
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -72,38 +49,62 @@ function backoffMsWithJitter(baseMs: number): number {
   return baseMs + jitter;
 }
 
-function lockKeyForResolve(
-  existingId: string | null,
-  tenantId: string,
-  normalizedPhone: string,
-): string {
-  if (existingId) return `lock:lead:${existingId}`;
-  return `lock:lead:resolve:${tenantId}:${normalizedPhone}`;
+function normalizeChannel(channel: string): string {
+  const value = channel.trim().toLowerCase();
+  if (!value) {
+    throw new Error("channel requerido");
+  }
+  return value;
 }
 
+function normalizeExternalId(externalId: string): string {
+  const value = externalId.trim();
+  if (!value) {
+    throw new Error("externalId requerido");
+  }
+  return value;
+}
+
+function lockKeyForResolve(
+  tenantId: string,
+  channel: string,
+  externalId: string,
+): string {
+  return `lock:lead:resolve:${tenantId}:${channel}:${externalId}`;
+}
+
+export type ResolveLeadInput = {
+  readonly tenantId: string;
+  readonly channel: string;
+  readonly externalId: string;
+  readonly traceId: string;
+  readonly metadata?: Record<string, unknown>;
+};
+
 export type IdentityManagerDeps = {
-  supabase?: () => SupabaseClient;
+  leadsRepository?: LeadsRepository;
   /** Por defecto se usa `getRedis` del módulo infra. */
   getRedis?: typeof getRedis;
-  ghl?: GHLIntegration;
   logger?: Logger;
   baseLogger?: Logger;
 };
 
 /**
- * Resolución de identidad multitenant (PRD §3, §4).
- * Supabase = SSOT; GHL = fallback; Redis SET NX EX = lock por lead / resolución.
+ * Resolución de identidad multitenant (ADR-007).
+ *
+ * Mapeo canónico:
+ *   (tenant_id, channel, external_id) -> lead
+ *
+ * Sin lógica específica por canal. Solo resolución de identidad + locking Redis.
  */
 export class IdentityManager {
-  private readonly getSupabase: () => SupabaseClient;
+  private readonly leadsRepository: LeadsRepository;
   private readonly connectRedis: typeof getRedis;
-  private readonly ghl: GHLIntegration;
   private readonly baseLogger: Logger;
 
   constructor(deps: IdentityManagerDeps = {}) {
-    this.getSupabase = deps.supabase ?? createSupabaseServerClient;
+    this.leadsRepository = deps.leadsRepository ?? new LeadsRepository();
     this.connectRedis = deps.getRedis ?? getRedis;
-    this.ghl = deps.ghl ?? new GHLIntegrationStub();
     this.baseLogger =
       deps.logger ??
       deps.baseLogger ??
@@ -114,51 +115,46 @@ export class IdentityManager {
   }
 
   /**
-   * Resuelve o crea el lead por (tenant_id, phone_number) con upsert seguro
-   * y lock Redis (PRD §4.1: máx. 3 reintentos con backoff).
+   * Resuelve o crea lead por identidad externa.
    */
-  async resolveLead(
-    phone: string,
-    tenantId: string,
-    traceId: string,
-  ): Promise<CoreLead> {
+  async resolveLead(input: ResolveLeadInput): Promise<CoreLead> {
+    const channel = normalizeChannel(input.channel);
+    const externalId = normalizeExternalId(input.externalId);
+    const tenantId = input.tenantId;
+    const traceId = input.traceId;
+
     const log = this.baseLogger.child({
       trace_id: traceId,
       module: "IdentityManager",
+      tenant_id: tenantId,
+      channel,
     });
 
-    if (!phone.trim()) {
-      log.warn({ step: "validate_phone" }, "teléfono vacío");
-      throw new Error("phone requerido");
+    const identity = await this.leadsRepository.findExternalIdentity({
+      tenantId,
+      channel,
+      externalId,
+    });
+    if (identity) {
+      const lead = await this.leadsRepository.findLeadById({
+        tenantId,
+        leadId: identity.lead_id,
+      });
+      if (lead) {
+        log.info({ step: "identity_cache_hit", leadId: lead.id }, "lead existente");
+        return lead;
+      }
+      log.warn(
+        {
+          step: "identity_orphan_detected",
+          identityId: identity.id,
+          leadId: identity.lead_id,
+        },
+        "identidad encontrada sin lead asociado; se intentará recomponer",
+      );
     }
 
-    let normalizedPhone: string;
-    try {
-      normalizedPhone = normalizePhoneE164(phone);
-    } catch (e) {
-      log.warn({ step: "validate_phone", err: String(e) }, "teléfono inválido");
-      throw e;
-    }
-
-    log.info(
-      { step: "phone_normalized", normalizedPhone },
-      "teléfono normalizado",
-    );
-
-    log.info({ step: "peek_lookup", tenantId }, "consulta inicial leads");
-
-    const supabase = this.getSupabase();
-    let peek: CoreLead | null = await this.fetchLead(
-      supabase,
-      tenantId,
-      normalizedPhone,
-    );
-
-    const lockKey = lockKeyForResolve(
-      peek?.id ?? null,
-      tenantId,
-      normalizedPhone,
-    );
+    const lockKey = lockKeyForResolve(tenantId, channel, externalId);
     const token = traceId;
 
     log.info({ step: "lock_acquire_start", lockKey }, "adquiriendo lock Redis");
@@ -170,53 +166,31 @@ export class IdentityManager {
     }
 
     try {
-      log.info({ step: "locked_lookup" }, "re-consulta bajo lock");
-      let row = await this.fetchLead(supabase, tenantId, normalizedPhone);
-
-      if (row) {
-        log.info({ step: "lead_cache_hit", leadId: row.id }, "lead existente");
-        return row;
-      }
-
-      log.info({ step: "ghl_fallback" }, "lead ausente; stub GHL");
-      const profile = await this.ghl.fetchLeadByPhone(
-        normalizedPhone,
+      const afterLockIdentity = await this.leadsRepository.findExternalIdentity({
         tenantId,
-        traceId,
-      );
-
-      const now = new Date().toISOString();
-
-      const payload: Record<string, unknown> = {
-        tenant_id: tenantId,
-        phone_number: normalizedPhone,
-        updated_at: now,
-      };
-      if (profile.firstName != null && profile.firstName !== "") {
-        payload.first_name = profile.firstName;
-      }
-      if (profile.email != null && profile.email !== "") {
-        payload.email = profile.email;
+        channel,
+        externalId,
+      });
+      if (afterLockIdentity) {
+        const lead = await this.leadsRepository.findLeadById({
+          tenantId,
+          leadId: afterLockIdentity.lead_id,
+        });
+        if (lead) {
+          log.info({ step: "identity_found_under_lock", leadId: lead.id }, "lead existente");
+          return lead;
+        }
       }
 
-      log.info({ step: "upsert_atomic" }, "upsert ON CONFLICT (tenant_id, phone_number)");
+      const lead = await this.leadsRepository.createLeadWithExternalIdentity({
+        tenantId,
+        channel,
+        externalId,
+        metadata: input.metadata,
+      });
 
-      const { data: upserted, error: upsertErr } = await supabase
-        .from("leads")
-        .upsert(payload, { onConflict: "tenant_id,phone_number" })
-        .select()
-        .single();
-
-      if (!upsertErr && upserted) {
-        log.info({ step: "upsert_ok", leadId: upserted.id }, "lead persistido");
-        return upserted as CoreLead;
-      }
-
-      log.error(
-        { step: "upsert_failed", err: upsertErr?.message },
-        "fallo upsert",
-      );
-      throw new Error(upsertErr?.message ?? "upsert leads falló");
+      log.info({ step: "identity_created", leadId: lead.id }, "lead creado con identidad externa");
+      return lead;
     } finally {
       try {
         const released = await redis.eval(RELEASE_LOCK_LUA, {
@@ -232,23 +206,6 @@ export class IdentityManager {
         log.warn({ step: "lock_release_skip", err: String(e) }, "no se liberó lock");
       }
     }
-  }
-
-  private async fetchLead(
-    client: SupabaseClient,
-    tenantId: string,
-    phone: string,
-  ): Promise<CoreLead | null> {
-    const { data, error } = await client
-      .from("leads")
-      .select("*")
-      .eq("tenant_id", tenantId)
-      .eq("phone_number", phone)
-      .maybeSingle();
-
-    if (error) throw new Error(`lookup leads: ${error.message}`);
-    if (!data) return null;
-    return data as CoreLead;
   }
 
   /**

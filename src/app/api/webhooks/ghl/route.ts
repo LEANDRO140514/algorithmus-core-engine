@@ -1,6 +1,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { createSupabaseServerClient } from "../../../../core/supabase_client";
 
+/**
+ * LEGACY: Supabase is only used for GHL webhook integration.
+ * It is NOT part of the Core Engine runtime.
+ * Core Engine uses PostgreSQL via LeadsRepository.
+ */
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 

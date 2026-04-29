@@ -3,7 +3,7 @@ import "./loadEnv";
 /**
  * Composition root: wiring, Express, listen. Sin lógica de negocio.
  *
- * Env críticas: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, REDIS_URL (en producción;
+ * Env críticas: DATABASE_URL (Postgres para leads/FSM), REDIS_URL (en producción;
  *   en desarrollo, por defecto redis://localhost:6379 si falta),
  * OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_HOST,
  * YCLOUD_API_KEY, YCLOUD_WHATSAPP_FROM.

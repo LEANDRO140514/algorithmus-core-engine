@@ -1,4 +1,3 @@
-import { createClient } from "@supabase/supabase-js";
 import type { Logger } from "pino";
 import { EmbeddingService } from "../core/embedding/EmbeddingService";
 import { FSMEngine } from "../core/fsm/FSMEngine";
@@ -34,6 +33,7 @@ import {
   type WhatsAppInboundJobProducer,
 } from "../infra/queue/queueClient";
 import { WHATSAPP_INBOUND_QUEUE } from "../infra/queue/jobTypes";
+import { LeadsRepository } from "../infra/postgres/LeadsRepository";
 import { getRedisUrl } from "../config/redisUrl";
 import { requireEnv, readEnvOptional, readPositiveInt } from "./envHelpers";
 
@@ -116,8 +116,7 @@ export async function createAppContext(
 ): Promise<AppContext> {
   await getRedis();
 
-  const supabaseUrl = requireEnv(log, "SUPABASE_URL");
-  const supabaseServiceRoleKey = requireEnv(log, "SUPABASE_SERVICE_ROLE_KEY");
+  requireEnv(log, "DATABASE_URL");
   const redisUrl = getRedisUrl();
   requireEnv(log, "OPENAI_API_KEY");
   requireEnv(log, "PINECONE_API_KEY");
@@ -146,12 +145,7 @@ export async function createAppContext(
       ? new NoopMetrics()
       : new PrometheusMetricsAdapter();
 
-  const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-    },
-  });
+  const leadsRepository = new LeadsRepository();
 
   const ycloudClient = new YCloudClient({
     logger: log,
@@ -189,7 +183,7 @@ export async function createAppContext(
   const fsmEngine = new FSMEngine();
   const llmGateway = new LLMGateway({ logger: log, metrics });
   const identityManager = new IdentityManager({
-    supabase: () => supabase,
+    leadsRepository,
     getRedis,
     logger: log,
   });
@@ -282,7 +276,7 @@ export async function createAppContext(
   const orchestrator = new Orchestrator({
     logger: log,
     metrics,
-    supabase: () => supabase,
+    leadsRepository,
     fsmEngine,
     llmGateway,
     ragService: rag,

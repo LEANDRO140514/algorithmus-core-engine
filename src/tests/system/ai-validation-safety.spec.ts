@@ -7,6 +7,8 @@ import { LLMGateway } from "../../core/llm/LLMGateway";
 import type { RAGDocument } from "../../core/rag/RAGService";
 import { RAGService } from "../../core/rag/RAGService";
 import { Orchestrator } from "../../core/orchestrator/Orchestrator";
+import type { LeadRecord } from "../../infra/postgres/LeadsRepository";
+import { LeadsRepository } from "../../infra/postgres/LeadsRepository";
 import type {
   AIValidator,
   SafetyPort,
@@ -51,23 +53,39 @@ function buildFSMContext(overrides: Partial<FSMContext> = {}): FSMContext {
   };
 }
 
-function makeSupabaseStub(): { client: () => unknown; updateCalls: () => number } {
-  let updateCount = 0;
-  const chain: Record<string, unknown> = {};
-  const thenable = {
-    then: (onFulfilled: (value: { error: null }) => unknown) =>
-      Promise.resolve({ error: null }).then(onFulfilled),
-  };
-  chain.from = () => chain;
-  chain.update = () => {
-    updateCount += 1;
-    return chain;
-  };
-  chain.eq = () => Object.assign(chain, thenable);
+function stubLeadRecord(overrides: Partial<LeadRecord> = {}): LeadRecord {
+  const now = new Date().toISOString();
   return {
-    client: () => chain,
-    updateCalls: () => updateCount,
+    id: "lead-test",
+    tenant_id: "tenant-test",
+    phone_number: "+10000000000",
+    first_name: null,
+    email: null,
+    tags: {},
+    fsm_state: "SUPPORT_RAG",
+    ai_confidence_score: 0,
+    last_interaction: null,
+    created_at: now,
+    updated_at: now,
+    ...overrides,
   };
+}
+
+function makeLeadsRepositoryStub(): {
+  repo: LeadsRepository;
+  updateCalls: () => number;
+} {
+  let updateCount = 0;
+  const repo = {
+    findByPhone: async () => null,
+    upsertLead: async () => stubLeadRecord(),
+    updateFsmState: async () => {
+      updateCount += 1;
+      return stubLeadRecord();
+    },
+    insertFromGhl: async () => stubLeadRecord(),
+  } as unknown as LeadsRepository;
+  return { repo, updateCalls: () => updateCount };
 }
 
 class StubSafetyPort implements SafetyPort {
@@ -87,7 +105,7 @@ type BuildOpts = {
 
 function buildOrchestrator(opts: BuildOpts): {
   orchestrator: Orchestrator;
-  supabaseUpdateCalls: () => number;
+  repositoryUpdateCalls: () => number;
 } {
   const fsmEngine = new FSMEngine();
   const llm = new LLMGateway();
@@ -103,10 +121,10 @@ function buildOrchestrator(opts: BuildOpts): {
       .mockResolvedValue({ documents: docs, usedTopK: docs.length || 5 });
   }
 
-  const supabaseStub = makeSupabaseStub();
+  const leadsStub = makeLeadsRepositoryStub();
 
   const orchestrator = new Orchestrator({
-    supabase: supabaseStub.client as () => never,
+    leadsRepository: leadsStub.repo,
     fsmEngine,
     llmGateway: llm,
     ragService: rag,
@@ -119,7 +137,7 @@ function buildOrchestrator(opts: BuildOpts): {
 
   return {
     orchestrator,
-    supabaseUpdateCalls: supabaseStub.updateCalls,
+    repositoryUpdateCalls: leadsStub.updateCalls,
   };
 }
 
@@ -154,7 +172,7 @@ describe("SafetyPort — destructive system tests", () => {
       safetyPort: new StubSafetyPort(async () => SAFE_OUTPUT),
     });
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: aiPayload,
         provider: "ollama",
@@ -177,7 +195,7 @@ describe("SafetyPort — destructive system tests", () => {
     expect(result.messageToSend).toBe(aiPayload);
     expect(result.internalDiagnostics?.decisionAction).toBe("accept");
     expect(result.internalDiagnostics?.hardGateBlocked).toBeFalsy();
-    expect(supabaseUpdateCalls()).toBe(1); // INIT -> SUPPORT_RAG
+    expect(repositoryUpdateCalls()).toBe(1); // INIT -> SUPPORT_RAG
   });
 
   // ---------------------------------------------------------------------------
@@ -190,7 +208,7 @@ describe("SafetyPort — destructive system tests", () => {
       safetyPort: new StubSafetyPort(async () => UNSAFE_OUTPUT),
     });
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: aiPayload,
         provider: "ollama",
@@ -214,7 +232,7 @@ describe("SafetyPort — destructive system tests", () => {
     expect(result.internalDiagnostics?.decisionAction).toBe("handover");
     expect(result.internalDiagnostics?.hardGateBlocked).toBe(true);
     expect(result.internalDiagnostics?.hardGateReason).toBe("blocked_unsafe");
-    expect(supabaseUpdateCalls()).toBe(0);
+    expect(repositoryUpdateCalls()).toBe(0);
   });
 
   // ---------------------------------------------------------------------------
@@ -229,7 +247,7 @@ describe("SafetyPort — destructive system tests", () => {
       }),
     });
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: aiPayload,
         provider: "ollama",
@@ -253,7 +271,7 @@ describe("SafetyPort — destructive system tests", () => {
     expect(result.internalDiagnostics?.decisionAction).toBe("handover");
     expect(result.internalDiagnostics?.hardGateBlocked).toBe(true);
     expect(result.internalDiagnostics?.hardGateReason).toBe("blocked_unsafe");
-    expect(supabaseUpdateCalls()).toBe(0);
+    expect(repositoryUpdateCalls()).toBe(0);
   });
 
   // ---------------------------------------------------------------------------
@@ -269,7 +287,7 @@ describe("SafetyPort — destructive system tests", () => {
       safetyTimeoutMs: 50,
     });
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: aiPayload,
         provider: "ollama",
@@ -293,7 +311,7 @@ describe("SafetyPort — destructive system tests", () => {
     expect(result.internalDiagnostics?.decisionAction).toBe("handover");
     expect(result.internalDiagnostics?.hardGateBlocked).toBe(true);
     expect(result.internalDiagnostics?.hardGateReason).toBe("blocked_unsafe");
-    expect(supabaseUpdateCalls()).toBe(0);
+    expect(repositoryUpdateCalls()).toBe(0);
   });
 
   // ---------------------------------------------------------------------------
@@ -304,7 +322,7 @@ describe("SafetyPort — destructive system tests", () => {
   it("SAFETY-5: SAFETY_PORT_ENABLED=false (BasicAIValidator) + flujo válido → emite texto IA", async () => {
     const aiPayload = "respuesta valida con kill switch off";
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: aiPayload,
         provider: "ollama",
@@ -325,7 +343,7 @@ describe("SafetyPort — destructive system tests", () => {
 
     expect(result.messageToSend).toBe(aiPayload);
     expect(result.internalDiagnostics?.decisionAction).toBe("accept");
-    expect(supabaseUpdateCalls()).toBe(1);
+    expect(repositoryUpdateCalls()).toBe(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -336,7 +354,7 @@ describe("SafetyPort — destructive system tests", () => {
   it("SAFETY-6: SAFETY_PORT_ENABLED=false NO es bypass — low confidence sigue bloqueando", async () => {
     const aiPayload = "low_conf_payload";
 
-    const { orchestrator, supabaseUpdateCalls } = buildOrchestrator({
+    const { orchestrator, repositoryUpdateCalls } = buildOrchestrator({
       llmResponse: {
         text: aiPayload,
         provider: "ollama",
@@ -358,6 +376,6 @@ describe("SafetyPort — destructive system tests", () => {
     expect(result.messageToSend).not.toBe(aiPayload);
     expect(result.messageToSend).toBe(SAFE_FALLBACK_MESSAGE);
     expect(result.internalDiagnostics?.decisionAction).toBe("retry");
-    expect(supabaseUpdateCalls()).toBe(0);
+    expect(repositoryUpdateCalls()).toBe(0);
   });
 });

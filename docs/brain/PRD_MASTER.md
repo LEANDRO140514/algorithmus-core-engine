@@ -33,7 +33,7 @@ Modularidad: Boundaries por dominio (core, modules, infra).
 
 Comunicación interna: Event-driven (no llamadas directas entre módulos).
 
-Estado: Persistido en Postgres (Supabase).
+Estado: Persistido en PostgreSQL (direct connection, Supabase removed from core runtime).
 
 Coordinación: Redis (locks + events).
 

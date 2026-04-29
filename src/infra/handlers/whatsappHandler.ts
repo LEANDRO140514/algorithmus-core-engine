@@ -242,11 +242,12 @@ export async function handleWhatsAppWebhook(
   let leadIdForScope: string | undefined;
 
   try {
-    const lead = await services.identityManager.resolveLead(
-      inbound.externalUserId,
-      inbound.tenantId,
+    const lead = await services.identityManager.resolveLead({
+      tenantId: inbound.tenantId,
+      channel: "whatsapp",
+      externalId: inbound.externalUserId,
       traceId,
-    );
+    });
 
     leadIdForScope = lead.id;
 
@@ -309,3 +310,4 @@ export async function handleWhatsAppWebhook(
     res.status(500).send("internal error");
   }
 }
+
